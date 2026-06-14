@@ -1,18 +1,43 @@
 /**
- * Deriv WebSocket API Client
- * Official API: wss://ws.binaryws.com/websockets/v3
- * Docs: https://api.deriv.com/
+ * Deriv API Client — supports pat_def… Personal Access Tokens + legacy tokens
+ *
+ * Auth flow:
+ *  1. POST /api/verify-token  (server-side WS with correct Origin headers)
+ *     → returns account info + which app_id worked
+ *  2. Open browser WebSocket using that confirmed app_id
+ *  3. Re-authorize in browser WS for live subscriptions
+ *
+ * This two-step approach solves the browser Origin restriction:
+ * the server can set any Origin header, so it finds the working app_id,
+ * then the browser WS uses the same app_id (which Deriv accepts from any Origin
+ * once we know it works).
  */
 
-export const DERIV_WS_URL = 'wss://ws.binaryws.com/websockets/v3?app_id=';
-export const DERIV_APP_ID = process.env.NEXT_PUBLIC_DERIV_APP_ID || '1089'; // Default public app_id
+const WS_ENDPOINT = 'wss://ws.binaryws.com/websockets/v3';
 
-type MessageCallback = (data: DerivResponse) => void;
+// Deriv app IDs tried in browser after server verifies which one works
+const BROWSER_APP_IDS = ['1089', '36544', '16929'];
 
-export interface DerivResponse {
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+type MsgCb = (msg: DerivMsg) => void;
+
+export interface DerivMsg {
   msg_type: string;
+  req_id?: number;
   error?: { code: string; message: string };
   [key: string]: unknown;
+}
+
+export interface DerivAccount {
+  loginid: string;
+  email?: string;
+  fullname?: string;
+  balance?: number;
+  currency?: string;
+  account_type?: string;
+  is_virtual?: number;
+  landing_company_name?: string;
 }
 
 export interface ActiveSymbol {
@@ -30,6 +55,19 @@ export interface TickData {
   quote: number;
   bid?: number;
   ask?: number;
+}
+
+export interface TickHistory {
+  prices: number[];
+  times: number[];
+}
+
+export interface CandleData {
+  epoch: number;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
 }
 
 export interface ContractProposal {
@@ -50,327 +88,6 @@ export interface BuyResponse {
   transaction_id: number;
   start_time: number;
   shortcode: string;
-}
-
-class DerivAPIClient {
-  private ws: WebSocket | null = null;
-  private reqId = 1;
-  private callbacks = new Map<number, (data: DerivResponse) => void>();
-  private subscriptions = new Map<string, MessageCallback[]>();
-  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  private token: string | null = null;
-  private isAuthorized = false;
-  private messageQueue: string[] = [];
-  private onConnectCallbacks: (() => void)[] = [];
-  private onDisconnectCallbacks: (() => void)[] = [];
-  private onAuthCallbacks: ((account: DerivAccount) => void)[] = [];
-  private appId: string;
-
-  constructor(appId?: string) {
-    this.appId = appId || DERIV_APP_ID;
-  }
-
-  connect(token?: string): Promise<void> {
-    return new Promise((resolve, reject) => {
-      if (token) this.token = token;
-
-      const url = `${DERIV_WS_URL}${this.appId}`;
-      this.ws = new WebSocket(url);
-
-      this.ws.onopen = () => {
-        // Flush queued messages
-        while (this.messageQueue.length > 0) {
-          this.ws?.send(this.messageQueue.shift()!);
-        }
-        this.onConnectCallbacks.forEach(cb => cb());
-        if (this.token) {
-          this.authorize(this.token).then(() => resolve()).catch(reject);
-        } else {
-          resolve();
-        }
-      };
-
-      this.ws.onmessage = (event) => {
-        try {
-          const data: DerivResponse = JSON.parse(event.data);
-          this.handleMessage(data);
-        } catch (e) {
-          console.error('Failed to parse WS message', e);
-        }
-      };
-
-      this.ws.onerror = (err) => {
-        console.error('WebSocket error', err);
-        reject(err);
-      };
-
-      this.ws.onclose = () => {
-        this.isAuthorized = false;
-        this.onDisconnectCallbacks.forEach(cb => cb());
-        this.scheduleReconnect();
-      };
-    });
-  }
-
-  private scheduleReconnect() {
-    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-    this.reconnectTimer = setTimeout(() => {
-      if (this.token) this.connect(this.token);
-    }, 5000);
-  }
-
-  private handleMessage(data: DerivResponse) {
-    // Route to one-time callbacks
-    const reqId = data.req_id as number;
-    if (reqId && this.callbacks.has(reqId)) {
-      const cb = this.callbacks.get(reqId)!;
-      this.callbacks.delete(reqId);
-      cb(data);
-    }
-
-    // Route to subscriptions
-    const msgType = data.msg_type;
-    if (msgType && this.subscriptions.has(msgType)) {
-      this.subscriptions.get(msgType)!.forEach(cb => cb(data));
-    }
-
-    // Handle authorize
-    if (msgType === 'authorize' && !data.error) {
-      this.isAuthorized = true;
-      const account = (data as unknown as { authorize: DerivAccount }).authorize;
-      this.onAuthCallbacks.forEach(cb => cb(account));
-    }
-  }
-
-  private send<T>(payload: Record<string, unknown>): Promise<T & DerivResponse> {
-    return new Promise((resolve, reject) => {
-      const id = this.reqId++;
-      payload.req_id = id;
-
-      this.callbacks.set(id, (data) => {
-        if (data.error) reject(new Error(data.error.message));
-        else resolve(data as T & DerivResponse);
-      });
-
-      const msg = JSON.stringify(payload);
-      if (this.ws?.readyState === WebSocket.OPEN) {
-        this.ws.send(msg);
-      } else {
-        this.messageQueue.push(msg);
-      }
-    });
-  }
-
-  // ─── Auth ───────────────────────────────────────────────────────────────────
-
-  async authorize(token: string): Promise<DerivAccount> {
-    this.token = token;
-    const res = await this.send<{ authorize: DerivAccount }>({ authorize: token });
-    return res.authorize;
-  }
-
-  async getAccountList(): Promise<DerivAccount[]> {
-    const res = await this.send<{ account_list: DerivAccount[] }>({
-      account_list: 1,
-    });
-    return res.account_list || [];
-  }
-
-  async switchAccount(token: string): Promise<DerivAccount> {
-    return this.authorize(token);
-  }
-
-  // ─── Market Data ─────────────────────────────────────────────────────────────
-
-  async getActiveSymbols(): Promise<ActiveSymbol[]> {
-    const res = await this.send<{ active_symbols: ActiveSymbol[] }>({
-      active_symbols: 'brief',
-      product_type: 'basic',
-    });
-    return res.active_symbols || [];
-  }
-
-  subscribeToTicks(symbol: string, callback: (tick: TickData) => void): () => void {
-    const id = this.reqId++;
-    const payload = { ticks: symbol, subscribe: 1, req_id: id };
-
-    const handler: MessageCallback = (data) => {
-      if (data.msg_type === 'tick') {
-        const tick = (data as unknown as { tick: TickData }).tick;
-        if (tick?.symbol === symbol) callback(tick);
-      }
-    };
-
-    if (!this.subscriptions.has('tick')) this.subscriptions.set('tick', []);
-    this.subscriptions.get('tick')!.push(handler);
-
-    const msg = JSON.stringify(payload);
-    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(msg);
-    else this.messageQueue.push(msg);
-
-    return () => {
-      const handlers = this.subscriptions.get('tick') || [];
-      this.subscriptions.set('tick', handlers.filter(h => h !== handler));
-      this.send({ forget_all: 'ticks' }).catch(() => {});
-    };
-  }
-
-  async getCandles(symbol: string, granularity = 60, count = 100): Promise<CandleData[]> {
-    const res = await this.send<{ candles: CandleData[] }>({
-      ticks_history: symbol,
-      style: 'candles',
-      granularity,
-      count,
-      end: 'latest',
-    });
-    return res.candles || [];
-  }
-
-  async getTickHistory(symbol: string, count = 500): Promise<TickHistory> {
-    const res = await this.send<{ history: TickHistory }>({
-      ticks_history: symbol,
-      end: 'latest',
-      count,
-      style: 'ticks',
-    });
-    return res.history;
-  }
-
-  // ─── Trading ─────────────────────────────────────────────────────────────────
-
-  async getProposal(params: ProposalParams): Promise<ContractProposal> {
-    const res = await this.send<{ proposal: ContractProposal }>({
-      proposal: 1,
-      amount: params.amount,
-      basis: 'stake',
-      contract_type: params.contract_type,
-      currency: params.currency || 'USD',
-      duration: params.duration,
-      duration_unit: params.duration_unit || 't',
-      symbol: params.symbol,
-    });
-    return res.proposal;
-  }
-
-  async buyContract(proposalId: string, price: number): Promise<BuyResponse> {
-    const res = await this.send<{ buy: BuyResponse }>({
-      buy: proposalId,
-      price,
-    });
-    return res.buy;
-  }
-
-  async sellContract(contractId: number): Promise<unknown> {
-    return this.send({ sell: contractId, price: 0 });
-  }
-
-  async getPortfolio(): Promise<PortfolioContract[]> {
-    const res = await this.send<{ portfolio: { contracts: PortfolioContract[] } }>({
-      portfolio: 1,
-    });
-    return res.portfolio?.contracts || [];
-  }
-
-  async getBalance(): Promise<{ balance: number; currency: string; loginid: string }> {
-    const res = await this.send<{ balance: { balance: number; currency: string; loginid: string } }>({
-      balance: 1,
-    });
-    return res.balance;
-  }
-
-  subscribeToBalance(callback: (balance: { balance: number; currency: string }) => void): () => void {
-    const id = this.reqId++;
-    const payload = { balance: 1, subscribe: 1, req_id: id };
-
-    const handler: MessageCallback = (data) => {
-      if (data.msg_type === 'balance') {
-        const b = (data as unknown as { balance: { balance: number; currency: string } }).balance;
-        if (b) callback(b);
-      }
-    };
-
-    if (!this.subscriptions.has('balance')) this.subscriptions.set('balance', []);
-    this.subscriptions.get('balance')!.push(handler);
-
-    const msg = JSON.stringify(payload);
-    if (this.ws?.readyState === WebSocket.OPEN) this.ws.send(msg);
-    else this.messageQueue.push(msg);
-
-    return () => {
-      const handlers = this.subscriptions.get('balance') || [];
-      this.subscriptions.set('balance', handlers.filter(h => h !== handler));
-    };
-  }
-
-  async getTransactionHistory(limit = 50): Promise<Transaction[]> {
-    const res = await this.send<{ statement: { transactions: Transaction[] } }>({
-      statement: 1,
-      description: 1,
-      limit,
-    });
-    return res.statement?.transactions || [];
-  }
-
-  async getProfitTable(): Promise<ProfitEntry[]> {
-    const res = await this.send<{ profit_table: { transactions: ProfitEntry[] } }>({
-      profit_table: 1,
-      description: 1,
-      limit: 50,
-    });
-    return res.profit_table?.transactions || [];
-  }
-
-  // ─── Event Listeners ─────────────────────────────────────────────────────────
-
-  onConnect(cb: () => void) { this.onConnectCallbacks.push(cb); }
-  onDisconnect(cb: () => void) { this.onDisconnectCallbacks.push(cb); }
-  onAuth(cb: (account: DerivAccount) => void) { this.onAuthCallbacks.push(cb); }
-
-  disconnect() {
-    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-    this.token = null;
-    this.ws?.close();
-  }
-
-  get connected() { return this.ws?.readyState === WebSocket.OPEN; }
-  get authorized() { return this.isAuthorized; }
-}
-
-// ─── Types ────────────────────────────────────────────────────────────────────
-
-export interface DerivAccount {
-  account_id?: string;
-  loginid: string;
-  token?: string;
-  email?: string;
-  fullname?: string;
-  balance?: number;
-  currency?: string;
-  account_type?: string;
-  is_virtual?: number;
-  landing_company_name?: string;
-}
-
-export interface CandleData {
-  epoch: number;
-  open: number;
-  high: number;
-  low: number;
-  close: number;
-}
-
-export interface TickHistory {
-  prices: number[];
-  times: number[];
-}
-
-export interface ProposalParams {
-  symbol: string;
-  amount: number;
-  contract_type: 'CALL' | 'PUT' | 'DIGITMATCH' | 'DIGITDIFF' | 'EVEN' | 'ODD';
-  duration: number;
-  duration_unit?: 't' | 's' | 'm' | 'h' | 'd';
-  currency?: string;
 }
 
 export interface PortfolioContract {
@@ -406,11 +123,373 @@ export interface ProfitEntry {
   sell_time: number;
 }
 
-// Singleton
-let clientInstance: DerivAPIClient | null = null;
-export function getDerivClient(): DerivAPIClient {
-  if (!clientInstance) clientInstance = new DerivAPIClient();
-  return clientInstance;
+export interface ProposalParams {
+  symbol: string;
+  amount: number;
+  contract_type: 'CALL' | 'PUT' | 'DIGITMATCH' | 'DIGITDIFF' | 'EVEN' | 'ODD';
+  duration: number;
+  duration_unit?: 't' | 's' | 'm' | 'h' | 'd';
+  currency?: string;
 }
 
+// ─── Step 1: server-side verify ──────────────────────────────────────────────
+
+async function serverVerifyToken(token: string): Promise<{ account: DerivAccount; appId: string }> {
+  const res = await fetch('/api/verify-token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ token }),
+  });
+
+  const data = await res.json();
+
+  if (!res.ok || !data.success) {
+    throw new Error(data.error || data.hint || 'Token verification failed');
+  }
+
+  return { account: data.account as DerivAccount, appId: data.appId as string };
+}
+
+// ─── Step 2: browser WS authorize ────────────────────────────────────────────
+
+function browserAuthorize(appId: string, token: string): Promise<{ ws: WebSocket; account: DerivAccount }> {
+  return new Promise((resolve, reject) => {
+    // Try the confirmed app_id first, then fallbacks
+    const idsToTry = [appId, ...BROWSER_APP_IDS.filter(id => id !== appId)];
+    let idx = 0;
+
+    const tryNext = () => {
+      if (idx >= idsToTry.length) {
+        reject(new Error('Browser WebSocket connection failed — please refresh and try again.'));
+        return;
+      }
+      const id = idsToTry[idx++];
+      const url = `${WS_ENDPOINT}?app_id=${id}&l=EN&brand=deriv`;
+
+      let ws: WebSocket;
+      try {
+        ws = new WebSocket(url);
+      } catch {
+        tryNext();
+        return;
+      }
+
+      const timer = setTimeout(() => {
+        ws.close();
+        tryNext();
+      }, 10000);
+
+      ws.onopen = () => {
+        ws.send(JSON.stringify({ authorize: token, req_id: 1 }));
+      };
+
+      ws.onmessage = (evt) => {
+        try {
+          const msg = JSON.parse(evt.data as string) as DerivMsg;
+          if (msg.msg_type !== 'authorize') return;
+          clearTimeout(timer);
+          if (msg.error) {
+            ws.close();
+            // Auth error is definitive — don't try more app_ids
+            reject(new Error(msg.error.message || 'Authorization failed'));
+          } else {
+            const account = (msg as unknown as { authorize: DerivAccount }).authorize;
+            // Hand off socket — don't close it
+            ws.onopen = null;
+            ws.onmessage = null;
+            ws.onerror = null;
+            ws.onclose = null;
+            clearTimeout(timer);
+            resolve({ ws, account });
+          }
+        } catch {
+          // ignore parse errors
+        }
+      };
+
+      ws.onerror = () => {
+        clearTimeout(timer);
+        tryNext();
+      };
+
+      ws.onclose = () => {
+        clearTimeout(timer);
+        // Only retry if we haven't resolved/rejected yet
+      };
+    };
+
+    tryNext();
+  });
+}
+
+// ─── Main client class ────────────────────────────────────────────────────────
+
+class DerivAPIClient {
+  private ws: WebSocket | null = null;
+  private reqId = 2; // 1 is used by initial authorize
+  private pending = new Map<number, (msg: DerivMsg) => void>();
+  private subs = new Map<string, MsgCb[]>();
+  private token: string | null = null;
+  private _appId = '1089';
+  private _authorized = false;
+  private reconnTimer: ReturnType<typeof setTimeout> | null = null;
+  private onDisconnectCbs: Array<() => void> = [];
+
+  // ── Public API ─────────────────────────────────────────────────────────────
+
+  /**
+   * Full connect+authorize flow.
+   * 1. Server verifies token and finds working app_id
+   * 2. Browser opens WS with that app_id and authorizes
+   */
+  async connectWithToken(token: string): Promise<DerivAccount> {
+    this.token = token;
+    this._authorized = false;
+    this.teardown();
+
+    // Step 1: server verify (handles Origin requirements, finds working app_id)
+    let verifiedAppId = '1089';
+    let serverAccount: DerivAccount | null = null;
+
+    try {
+      const { account, appId } = await serverVerifyToken(token);
+      verifiedAppId = appId;
+      serverAccount = account;
+    } catch (serverErr) {
+      // If server verify gives a clear auth error, surface it immediately
+      const msg = serverErr instanceof Error ? serverErr.message : String(serverErr);
+      const isAuthErr =
+        msg.toLowerCase().includes('invalid') ||
+        msg.toLowerCase().includes('authori') ||
+        msg.toLowerCase().includes('expired') ||
+        msg.toLowerCase().includes('rejected');
+      if (isAuthErr) throw serverErr;
+      // Network error on server — try browser WS directly
+      console.warn('Server verify failed (network?), trying browser WS directly:', msg);
+    }
+
+    // Step 2: open browser WebSocket + re-authorize for live data
+    try {
+      const { ws, account } = await browserAuthorize(verifiedAppId, token);
+      this.ws = ws;
+      this._appId = verifiedAppId;
+      this._authorized = true;
+
+      // Wire up ongoing message handling
+      ws.onmessage = (evt) => {
+        try {
+          const msg = JSON.parse(evt.data as string) as DerivMsg;
+          this.dispatch(msg);
+        } catch { /* ignore */ }
+      };
+      ws.onerror = () => { this._authorized = false; };
+      ws.onclose = (e) => {
+        this._authorized = false;
+        this.onDisconnectCbs.forEach(cb => cb());
+        if (e.code !== 1000 && this.token) this.scheduleReconnect();
+      };
+
+      return serverAccount || account;
+    } catch (wsErr) {
+      // Browser WS failed — return server account if we have it
+      if (serverAccount) {
+        // We verified the token works — WS just didn't open in browser
+        // This can happen in some browser environments; surface helpful error
+        throw new Error(
+          'Token is valid but browser WebSocket could not connect.\n' +
+          'Try: refreshing the page, disabling VPN, or using a different browser.'
+        );
+      }
+      throw wsErr;
+    }
+  }
+
+  async authorize(token: string): Promise<DerivAccount> {
+    return this.connectWithToken(token);
+  }
+
+  // ── Internal ───────────────────────────────────────────────────────────────
+
+  private teardown() {
+    if (this.reconnTimer) { clearTimeout(this.reconnTimer); this.reconnTimer = null; }
+    if (this.ws) {
+      this.ws.onopen = null;
+      this.ws.onmessage = null;
+      this.ws.onerror = null;
+      this.ws.onclose = null;
+      try { this.ws.close(1000); } catch { /* */ }
+      this.ws = null;
+    }
+    this.pending.forEach((_, id) => this.pending.delete(id));
+    this.subs.clear();
+  }
+
+  private scheduleReconnect() {
+    if (this.reconnTimer) clearTimeout(this.reconnTimer);
+    this.reconnTimer = setTimeout(async () => {
+      if (this.token) {
+        try { await this.connectWithToken(this.token); }
+        catch { this.scheduleReconnect(); }
+      }
+    }, 5000);
+  }
+
+  private dispatch(msg: DerivMsg) {
+    const id = msg.req_id;
+    if (id !== undefined && this.pending.has(id)) {
+      const cb = this.pending.get(id)!;
+      this.pending.delete(id);
+      cb(msg);
+      return;
+    }
+    if (msg.msg_type) {
+      (this.subs.get(msg.msg_type) || []).forEach(cb => cb(msg));
+    }
+  }
+
+  private send<T>(payload: Record<string, unknown>): Promise<T & DerivMsg> {
+    return new Promise((resolve, reject) => {
+      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+        reject(new Error('WebSocket not connected'));
+        return;
+      }
+      const id = this.reqId++;
+      payload.req_id = id;
+
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error('Request timed out'));
+      }, 30000);
+
+      this.pending.set(id, (msg) => {
+        clearTimeout(timer);
+        if (msg.error) reject(new Error(msg.error.message || 'Deriv API error'));
+        else resolve(msg as T & DerivMsg);
+      });
+
+      this.ws!.send(JSON.stringify(payload));
+    });
+  }
+
+  // ── Market data ────────────────────────────────────────────────────────────
+
+  async getActiveSymbols(): Promise<ActiveSymbol[]> {
+    const r = await this.send<{ active_symbols: ActiveSymbol[] }>({ active_symbols: 'brief', product_type: 'basic' });
+    return r.active_symbols || [];
+  }
+
+  subscribeToTicks(symbol: string, cb: (t: TickData) => void): () => void {
+    const id = this.reqId++;
+    const handler: MsgCb = (msg) => {
+      if (msg.msg_type === 'tick') {
+        const t = (msg as unknown as { tick: TickData }).tick;
+        if (t?.symbol === symbol) cb(t);
+      }
+    };
+    if (!this.subs.has('tick')) this.subs.set('tick', []);
+    this.subs.get('tick')!.push(handler);
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ ticks: symbol, subscribe: 1, req_id: id }));
+    }
+    return () => {
+      this.subs.set('tick', (this.subs.get('tick') || []).filter(h => h !== handler));
+    };
+  }
+
+  async getTickHistory(symbol: string, count = 200): Promise<TickHistory> {
+    const r = await this.send<{ history: TickHistory }>({ ticks_history: symbol, end: 'latest', count, style: 'ticks' });
+    return r.history;
+  }
+
+  async getCandles(symbol: string, granularity = 60, count = 100): Promise<CandleData[]> {
+    const r = await this.send<{ candles: CandleData[] }>({ ticks_history: symbol, style: 'candles', granularity, count, end: 'latest' });
+    return r.candles || [];
+  }
+
+  // ── Account ────────────────────────────────────────────────────────────────
+
+  async getBalance(): Promise<{ balance: number; currency: string; loginid: string }> {
+    const r = await this.send<{ balance: { balance: number; currency: string; loginid: string } }>({ balance: 1 });
+    return r.balance;
+  }
+
+  subscribeToBalance(cb: (b: { balance: number; currency: string }) => void): () => void {
+    const id = this.reqId++;
+    const handler: MsgCb = (msg) => {
+      if (msg.msg_type === 'balance') {
+        const b = (msg as unknown as { balance: { balance: number; currency: string } }).balance;
+        if (b) cb(b);
+      }
+    };
+    if (!this.subs.has('balance')) this.subs.set('balance', []);
+    this.subs.get('balance')!.push(handler);
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ balance: 1, subscribe: 1, req_id: id }));
+    }
+    return () => {
+      this.subs.set('balance', (this.subs.get('balance') || []).filter(h => h !== handler));
+    };
+  }
+
+  async getPortfolio(): Promise<PortfolioContract[]> {
+    const r = await this.send<{ portfolio: { contracts: PortfolioContract[] } }>({ portfolio: 1 });
+    return r.portfolio?.contracts || [];
+  }
+
+  async getTransactionHistory(limit = 50): Promise<Transaction[]> {
+    const r = await this.send<{ statement: { transactions: Transaction[] } }>({ statement: 1, description: 1, limit });
+    return r.statement?.transactions || [];
+  }
+
+  async getProfitTable(): Promise<ProfitEntry[]> {
+    const r = await this.send<{ profit_table: { transactions: ProfitEntry[] } }>({ profit_table: 1, description: 1, limit: 50 });
+    return r.profit_table?.transactions || [];
+  }
+
+  // ── Trading ────────────────────────────────────────────────────────────────
+
+  async getProposal(p: ProposalParams): Promise<ContractProposal> {
+    const r = await this.send<{ proposal: ContractProposal }>({
+      proposal: 1, amount: p.amount, basis: 'stake',
+      contract_type: p.contract_type, currency: p.currency || 'USD',
+      duration: p.duration, duration_unit: p.duration_unit || 't', symbol: p.symbol,
+    });
+    return r.proposal;
+  }
+
+  async buyContract(proposalId: string, price: number): Promise<BuyResponse> {
+    const r = await this.send<{ buy: BuyResponse }>({ buy: proposalId, price });
+    return r.buy;
+  }
+
+  async sellContract(contractId: number): Promise<unknown> {
+    return this.send({ sell: contractId, price: 0 });
+  }
+
+  // ── Lifecycle ──────────────────────────────────────────────────────────────
+
+  onDisconnect(cb: () => void) { this.onDisconnectCbs.push(cb); }
+
+  disconnect() {
+    this.token = null;
+    this._authorized = false;
+    this.teardown();
+  }
+
+  get connected() { return this.ws?.readyState === WebSocket.OPEN; }
+  get authorized() { return this._authorized; }
+  get usedAppId() { return this._appId; }
+}
+
+// ─── Singleton ────────────────────────────────────────────────────────────────
+
+let _client: DerivAPIClient | null = null;
+export function getDerivClient(): DerivAPIClient {
+  if (!_client) _client = new DerivAPIClient();
+  return _client;
+}
+export function resetDerivClient(): void {
+  _client?.disconnect();
+  _client = null;
+}
 export { DerivAPIClient };
