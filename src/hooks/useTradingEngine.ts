@@ -1,148 +1,163 @@
 'use client';
 import { useEffect, useRef, useCallback } from 'react';
-import { getDerivClient } from '@/lib/deriv-api';
+import { getDerivClient, resetDerivClient } from '@/lib/deriv-api';
 import { analyzeMarket, historyToPrices } from '@/lib/trading-engine';
 import { useTradingStore } from '@/store/trading-store';
 import type { TradeRecord } from '@/store/trading-store';
 
-const ANALYSIS_INTERVAL_MS = 15000; // Analyze every 15s
-const cooldowns = new Map<string, number>(); // symbol → last trade timestamp
+const ANALYSIS_INTERVAL_MS = 15000;
+const cooldowns = new Map<string, number>();
 
 export function useTradingEngine() {
   const {
-    connectionStatus,
-    setConnectionStatus,
-    setActiveAccount,
-    setBalance,
-    tokens,
-    selectedSymbols,
-    addTick,
-    setSignal,
-    setOpenContracts,
-    setTransactions,
-    autonomousMode,
-    riskSettings,
-    addTrade,
-    updateTrade,
-    addNotification,
-    updateStats,
-    signals,
-    ticks,
-    dailyPnl,
-    setSymbols,
+    connectionStatus, setConnectionStatus,
+    setActiveAccount, setBalance,
+    selectedSymbols, addTick, setSignal,
+    setOpenContracts, setTransactions,
+    autonomousMode, riskSettings,
+    addTrade, updateTrade, addNotification, updateStats,
+    dailyPnl, setSymbols,
   } = useTradingStore();
 
-  const client = getDerivClient();
-  const analysisTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const tickUnsubRefs = useRef<Map<string, () => void>>(new Map());
-  const balanceUnsubRef = useRef<(() => void) | null>(null);
+  const analysisTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+  const tickUnsubs = useRef<Map<string, () => void>>(new Map());
+  const balUnsub = useRef<(() => void) | null>(null);
+  const connecting = useRef(false);
 
-  // ─── Connect ────────────────────────────────────────────────────────────────
+  // ── connect ──────────────────────────────────────────────────────────────
 
   const connect = useCallback(async (token: string) => {
+    if (connecting.current) return;
+    connecting.current = true;
     setConnectionStatus('connecting');
+
     try {
-      await client.connect(token);
-      const account = await client.authorize(token);
+      resetDerivClient();
+      const client = getDerivClient();
+
+      // connectWithToken: server-verifies then opens browser WS
+      // supports pat_def... and legacy tokens
+      const account = await client.connectWithToken(token);
+
       setActiveAccount(account);
       setConnectionStatus('authorized');
 
-      // Fetch balance
-      const bal = await client.getBalance();
-      setBalance(bal.balance, bal.currency);
+      // Live balance subscription
+      try {
+        const bal = await client.getBalance();
+        setBalance(bal.balance, bal.currency);
+        balUnsub.current?.();
+        balUnsub.current = client.subscribeToBalance((b) =>
+          setBalance(b.balance, b.currency)
+        );
+      } catch { /* non-fatal */ }
 
-      // Subscribe to live balance
-      balanceUnsubRef.current?.();
-      balanceUnsubRef.current = client.subscribeToBalance((b) => {
-        setBalance(b.balance, b.currency);
-      });
+      // Active symbols list
+      try {
+        const syms = await client.getActiveSymbols();
+        setSymbols(syms);
+      } catch { /* non-fatal */ }
 
-      // Load symbols
-      const symbols = await client.getActiveSymbols();
-      setSymbols(symbols);
-
-      // Load portfolio & transactions
-      const [portfolio, txs] = await Promise.all([
-        client.getPortfolio(),
-        client.getTransactionHistory(50),
-      ]);
-      setOpenContracts(portfolio);
-      setTransactions(txs);
+      // Portfolio + transaction history
+      try {
+        const [portfolio, txs] = await Promise.allSettled([
+          client.getPortfolio(),
+          client.getTransactionHistory(50),
+        ]);
+        if (portfolio.status === 'fulfilled') setOpenContracts(portfolio.value);
+        if (txs.status === 'fulfilled') setTransactions(txs.value);
+      } catch { /* non-fatal */ }
 
       addNotification({
         type: 'success',
-        title: 'Connected',
-        message: `Authorized as ${account.loginid} • Balance: ${bal.currency} ${bal.balance.toFixed(2)}`,
+        title: 'Connected to Deriv',
+        message: `${account.is_virtual === 1 ? '🟡 DEMO' : '🟢 REAL'} • ${account.loginid}`,
       });
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Connection failed';
+      const raw = err instanceof Error ? err.message : String(err);
+      let msg = raw;
+      if (
+        raw.toLowerCase().includes('invalid') ||
+        raw.toLowerCase().includes('token') ||
+        raw.toLowerCase().includes('authori')
+      ) {
+        msg =
+          'Token rejected by Deriv.\n' +
+          '• Make sure you copied the full token (pat_def… tokens are long)\n' +
+          '• Token needs Read + Trade permissions\n' +
+          '• Create tokens at app.deriv.com → Account Settings → API Token';
+      } else if (raw.toLowerCase().includes('timeout')) {
+        msg = 'Connection timed out — check your internet and try again.';
+      }
       setConnectionStatus('error', msg);
-      addNotification({ type: 'error', title: 'Connection Error', message: msg });
+      addNotification({ type: 'error', title: 'Connection Failed', message: msg });
+      resetDerivClient();
+    } finally {
+      connecting.current = false;
     }
-  }, [client, setConnectionStatus, setActiveAccount, setBalance, setSymbols, setOpenContracts, setTransactions, addNotification]);
+  }, [
+    setConnectionStatus, setActiveAccount, setBalance,
+    setSymbols, setOpenContracts, setTransactions, addNotification,
+  ]);
 
-  // ─── Subscribe to ticks ───────────────────────────────────────────────────
+  // ── subscribe ticks ───────────────────────────────────────────────────────
 
   const subscribeSymbols = useCallback((symbols: string[]) => {
-    // Unsubscribe old
-    tickUnsubRefs.current.forEach(unsub => unsub());
-    tickUnsubRefs.current.clear();
-
-    symbols.forEach(symbol => {
-      const unsub = client.subscribeToTicks(symbol, (tick) => {
-        addTick(tick);
-      });
-      tickUnsubRefs.current.set(symbol, unsub);
+    const client = getDerivClient();
+    if (!client.connected) return;
+    tickUnsubs.current.forEach(fn => fn());
+    tickUnsubs.current.clear();
+    symbols.forEach(sym => {
+      try {
+        const unsub = client.subscribeToTicks(sym, (tick) => addTick(tick));
+        tickUnsubs.current.set(sym, unsub);
+      } catch { /* skip */ }
     });
-  }, [client, addTick]);
+  }, [addTick]);
 
-  // ─── Analysis Loop ────────────────────────────────────────────────────────
+  // ── analysis loop ─────────────────────────────────────────────────────────
 
   const runAnalysis = useCallback(async () => {
     if (connectionStatus !== 'authorized') return;
+    const client = getDerivClient();
+    if (!client.connected) return;
 
     for (const symbol of selectedSymbols) {
       try {
         const history = await client.getTickHistory(symbol, 200);
+        if (!history?.prices?.length) continue;
         const { prices, times } = historyToPrices(history);
         if (prices.length < 30) continue;
 
         const signal = analyzeMarket(symbol, prices, times);
         setSignal(symbol, signal);
 
-        // Auto-trade logic
-        if (!autonomousMode) continue;
-        if (signal.direction === 'NEUTRAL') continue;
+        if (!autonomousMode || signal.direction === 'NEUTRAL') continue;
         if (signal.confidence < riskSettings.minConfidence) continue;
-
-        // Daily loss guard
-        if (dailyPnl <= -riskSettings.maxDailyLoss) {
-          addNotification({
-            type: 'warning',
-            title: 'Daily Loss Limit Reached',
-            message: 'Auto-trading paused. Daily loss limit exceeded.',
-          });
-          continue;
-        }
-
-        // Cooldown guard
-        const lastTrade = cooldowns.get(symbol) || 0;
-        if (Date.now() - lastTrade < riskSettings.cooldownSeconds * 1000) continue;
-
-        // Open contracts guard
+        if (dailyPnl <= -riskSettings.maxDailyLoss) continue;
+        if (
+          Date.now() - (cooldowns.get(symbol) || 0) <
+          riskSettings.cooldownSeconds * 1000
+        ) continue;
         const { openContracts } = useTradingStore.getState();
         if (openContracts.length >= riskSettings.maxConcurrentTrades) continue;
 
-        // Execute trade
         cooldowns.set(symbol, Date.now());
-        await executeTrade(symbol, signal.direction as 'CALL' | 'PUT', riskSettings.stakeAmount, signal.confidence, 'auto');
-      } catch (err) {
-        console.error(`Analysis error for ${symbol}:`, err);
-      }
+        await executeTrade(
+          symbol,
+          signal.direction as 'CALL' | 'PUT',
+          riskSettings.stakeAmount,
+          signal.confidence,
+          'auto'
+        );
+      } catch { /* skip symbol on error */ }
     }
-  }, [connectionStatus, selectedSymbols, autonomousMode, riskSettings, dailyPnl, client, setSignal, addNotification]);
+  }, [
+    connectionStatus, selectedSymbols, autonomousMode,
+    riskSettings, dailyPnl, setSignal,
+  ]);
 
-  // ─── Execute Trade ────────────────────────────────────────────────────────
+  // ── execute trade ─────────────────────────────────────────────────────────
 
   const executeTrade = useCallback(async (
     symbol: string,
@@ -151,145 +166,132 @@ export function useTradingEngine() {
     confidence: number,
     source: 'auto' | 'manual',
     duration?: number,
-    durationUnit?: 't' | 'm'
+    durationUnit?: 't' | 'm',
   ): Promise<TradeRecord | null> => {
     if (connectionStatus !== 'authorized') {
-      addNotification({ type: 'error', title: 'Not Connected', message: 'Connect your Deriv account first.' });
+      addNotification({
+        type: 'error',
+        title: 'Not Connected',
+        message: 'Connect your Deriv account first.',
+      });
       return null;
     }
 
-    const tradeId = `trade_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const client = getDerivClient();
+    const tradeId = `t_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`;
     const sig = useTradingStore.getState().signals[symbol];
     const dur = duration ?? sig?.suggestedDuration ?? 5;
-    const durUnit = durationUnit ?? sig?.durationType ?? 'm';
+    const durUnit = durationUnit ?? sig?.durationType ?? 't';
 
-    const pendingRecord: TradeRecord = {
-      id: tradeId,
-      symbol,
-      direction,
-      stake,
-      confidence,
-      timestamp: Date.now(),
-      status: 'pending',
-      source,
+    const pending: TradeRecord = {
+      id: tradeId, symbol, direction, stake, confidence,
+      timestamp: Date.now(), status: 'pending', source,
     };
-    addTrade(pendingRecord);
+    addTrade(pending);
 
     try {
-      // 1. Get proposal
       const proposal = await client.getProposal({
-        symbol,
-        amount: stake,
+        symbol, amount: stake,
         contract_type: direction,
         duration: dur,
         duration_unit: durUnit,
       });
-
-      // 2. Buy contract
-      const buyResult = await client.buyContract(proposal.id, proposal.ask_price);
-      setBalance(buyResult.balance_after);
-
-      const record: Partial<TradeRecord> = {
+      const buy = await client.buyContract(proposal.id, proposal.ask_price);
+      setBalance(buy.balance_after);
+      updateTrade(tradeId, {
         status: 'open',
-        contractId: buyResult.contract_id,
-        buyPrice: buyResult.buy_price,
-        payout: buyResult.payout,
-      };
-      updateTrade(tradeId, record);
-
+        contractId: buy.contract_id,
+        buyPrice: buy.buy_price,
+        payout: buy.payout,
+      });
       addNotification({
         type: 'info',
-        title: `${source === 'auto' ? '🤖 Auto' : '👤 Manual'} Trade Placed`,
-        message: `${direction} on ${symbol} • Stake: $${stake} • Conf: ${confidence}%`,
+        title: `${source === 'auto' ? '🤖 Auto' : '👤 Manual'} Trade`,
+        message: `${direction} ${symbol} • $${stake} • ${confidence}% conf`,
       });
-
-      // 3. Monitor contract result (poll every 2s)
-      monitorContract(tradeId, buyResult.contract_id, stake);
-
-      return { ...pendingRecord, ...record } as TradeRecord;
+      monitorContract(tradeId, buy.contract_id);
+      return { ...pending, status: 'open' };
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Trade failed';
       updateTrade(tradeId, { status: 'lost', profit: -stake });
-      addNotification({ type: 'error', title: 'Trade Error', message: msg });
+      addNotification({
+        type: 'error',
+        title: 'Trade Error',
+        message: err instanceof Error ? err.message : 'Trade failed',
+      });
       updateStats();
       return null;
     }
-  }, [connectionStatus, client, addTrade, updateTrade, setBalance, addNotification, updateStats]);
+  }, [
+    connectionStatus, addTrade, updateTrade,
+    setBalance, addNotification, updateStats,
+  ]);
 
-  // ─── Monitor Contract ─────────────────────────────────────────────────────
+  // ── monitor contract ──────────────────────────────────────────────────────
 
-  const monitorContract = useCallback((tradeId: string, contractId: number, stake: number) => {
+  const monitorContract = useCallback((tradeId: string, contractId: number) => {
     let attempts = 0;
-    const maxAttempts = 120; // 4 minutes max
-
     const poll = async () => {
-      if (attempts++ > maxAttempts) return;
+      if (attempts++ > 120) return;
       try {
+        const client = getDerivClient();
         const portfolio = await client.getPortfolio();
-        const contract = portfolio.find(c => c.contract_id === contractId);
         setOpenContracts(portfolio);
-
-        if (!contract) {
-          // Contract closed — fetch profit table
+        if (!portfolio.find(c => c.contract_id === contractId)) {
           const profits = await client.getProfitTable();
           const entry = profits.find(p => p.contract_id === contractId);
           if (entry) {
             const profit = entry.sell_price - entry.buy_price;
-            const won = profit > 0;
             updateTrade(tradeId, {
-              status: won ? 'won' : 'lost',
+              status: profit > 0 ? 'won' : 'lost',
               profit: Math.round(profit * 100) / 100,
             });
             addNotification({
-              type: won ? 'success' : 'error',
-              title: won ? '✅ Trade Won' : '❌ Trade Lost',
+              type: profit > 0 ? 'success' : 'error',
+              title: profit > 0 ? '✅ Won' : '❌ Lost',
               message: `P&L: ${profit >= 0 ? '+' : ''}$${profit.toFixed(2)}`,
             });
             updateStats();
-            // Refresh balance
             const bal = await client.getBalance();
             setBalance(bal.balance, bal.currency);
           }
           return;
         }
-        // Still open — check again
-        setTimeout(poll, 2000);
-      } catch {
-        setTimeout(poll, 3000);
-      }
+      } catch { /* retry */ }
+      setTimeout(poll, 2000);
     };
-
     setTimeout(poll, 2000);
-  }, [client, setOpenContracts, updateTrade, addNotification, updateStats, setBalance]);
+  }, [setOpenContracts, updateTrade, addNotification, updateStats, setBalance]);
 
-  // ─── Effects ──────────────────────────────────────────────────────────────
+  // ── auto-connect on mount if tokens saved ─────────────────────────────────
 
-  // Auto-connect on mount if tokens are saved
   useEffect(() => {
-    const { tokens } = useTradingStore.getState();
-    if (tokens.length > 0 && connectionStatus === 'disconnected') {
+    const { tokens, connectionStatus: cs } = useTradingStore.getState();
+    if (tokens.length > 0 && cs === 'disconnected') {
       connect(tokens[0].token);
     }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // Subscribe to ticks when symbols change or connection established
+  // ── subscribe ticks when authorized ──────────────────────────────────────
+
   useEffect(() => {
     if (connectionStatus === 'authorized') {
       subscribeSymbols(selectedSymbols);
     }
     return () => {
-      tickUnsubRefs.current.forEach(unsub => unsub());
-      tickUnsubRefs.current.clear();
+      tickUnsubs.current.forEach(fn => fn());
+      tickUnsubs.current.clear();
     };
   }, [connectionStatus, selectedSymbols, subscribeSymbols]);
 
-  // Analysis loop
+  // ── run analysis loop ─────────────────────────────────────────────────────
+
   useEffect(() => {
     if (connectionStatus !== 'authorized') return;
-    runAnalysis(); // Immediate first run
-    analysisTimerRef.current = setInterval(runAnalysis, ANALYSIS_INTERVAL_MS);
+    runAnalysis();
+    analysisTimer.current = setInterval(runAnalysis, ANALYSIS_INTERVAL_MS);
     return () => {
-      if (analysisTimerRef.current) clearInterval(analysisTimerRef.current);
+      if (analysisTimer.current) clearInterval(analysisTimer.current);
     };
   }, [connectionStatus, runAnalysis]);
 
