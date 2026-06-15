@@ -1,22 +1,15 @@
 /**
- * Deriv API Client — supports pat_def… Personal Access Tokens + legacy tokens
+ * Deriv API Client — pat_def… + legacy token support
  *
  * Auth flow:
- *  1. POST /api/verify-token  (server-side WS with correct Origin headers)
- *     → returns account info + which app_id worked
- *  2. Open browser WebSocket using that confirmed app_id
- *  3. Re-authorize in browser WS for live subscriptions
- *
- * This two-step approach solves the browser Origin restriction:
- * the server can set any Origin header, so it finds the working app_id,
- * then the browser WS uses the same app_id (which Deriv accepts from any Origin
- * once we know it works).
+ *  1. POST /api/verify-token  → server finds working app_id (sets correct Origin)
+ *  2. Browser WebSocket with confirmed app_id → live data + trading
  */
 
 const WS_ENDPOINT = 'wss://ws.binaryws.com/websockets/v3';
 
-// Deriv app IDs tried in browser after server verifies which one works
-const BROWSER_APP_IDS = ['1089', '36544', '16929'];
+// Try app_id=16929 first (app.deriv.com — where pat_ tokens are issued)
+const BROWSER_APP_IDS = ['16929', '1089', '36544', '11780'];
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -132,50 +125,46 @@ export interface ProposalParams {
   currency?: string;
 }
 
-// ─── Step 1: server-side verify ──────────────────────────────────────────────
+// ─── Step 1: server verify ────────────────────────────────────────────────────
 
-async function serverVerifyToken(token: string): Promise<{ account: DerivAccount; appId: string }> {
+async function serverVerify(token: string): Promise<{ account: DerivAccount; appId: string }> {
   const res = await fetch('/api/verify-token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ token }),
   });
+  const data = await res.json() as { success?: boolean; account?: DerivAccount; appId?: string; error?: string; debug?: string[] };
 
-  const data = await res.json();
-
-  if (!res.ok || !data.success) {
-    throw new Error(data.error || data.hint || 'Token verification failed');
+  if (!res.ok || !data.success || !data.account) {
+    // Surface the real Deriv error, not our wrapped message
+    throw new Error(data.error || 'Verification failed');
   }
-
-  return { account: data.account as DerivAccount, appId: data.appId as string };
+  return { account: data.account, appId: data.appId || '16929' };
 }
 
 // ─── Step 2: browser WS authorize ────────────────────────────────────────────
 
-function browserAuthorize(appId: string, token: string): Promise<{ ws: WebSocket; account: DerivAccount }> {
+function browserAuthorize(preferredAppId: string, token: string): Promise<{ ws: WebSocket; account: DerivAccount }> {
   return new Promise((resolve, reject) => {
-    // Try the confirmed app_id first, then fallbacks
-    const idsToTry = [appId, ...BROWSER_APP_IDS.filter(id => id !== appId)];
+    // Put the server-confirmed app_id first
+    const ids = [preferredAppId, ...BROWSER_APP_IDS.filter(id => id !== preferredAppId)];
     let idx = 0;
+    let lastErr = 'Browser WS failed';
 
     const tryNext = () => {
-      if (idx >= idsToTry.length) {
-        reject(new Error('Browser WebSocket connection failed — please refresh and try again.'));
+      if (idx >= ids.length) {
+        reject(new Error(lastErr));
         return;
       }
-      const id = idsToTry[idx++];
-      const url = `${WS_ENDPOINT}?app_id=${id}&l=EN&brand=deriv`;
+      const appId = ids[idx++];
+      const url = `${WS_ENDPOINT}?app_id=${appId}&l=EN&brand=deriv`;
 
       let ws: WebSocket;
-      try {
-        ws = new WebSocket(url);
-      } catch {
-        tryNext();
-        return;
-      }
+      try { ws = new WebSocket(url); }
+      catch { tryNext(); return; }
 
       const timer = setTimeout(() => {
-        ws.close();
+        try { ws.close(); } catch { /* */ }
         tryNext();
       }, 10000);
 
@@ -184,37 +173,30 @@ function browserAuthorize(appId: string, token: string): Promise<{ ws: WebSocket
       };
 
       ws.onmessage = (evt) => {
-        try {
-          const msg = JSON.parse(evt.data as string) as DerivMsg;
-          if (msg.msg_type !== 'authorize') return;
+        let msg: DerivMsg;
+        try { msg = JSON.parse(evt.data as string) as DerivMsg; }
+        catch { return; }
+        if (msg.msg_type !== 'authorize') return;
+
+        clearTimeout(timer);
+        if (msg.error) {
+          ws.onopen = null; ws.onmessage = null; ws.onerror = null; ws.onclose = null;
+          try { ws.close(); } catch { /* */ }
+          lastErr = msg.error.message || msg.error.code;
+          // Try next app_id — don't give up on single InvalidToken
+          tryNext();
+        } else {
+          const account = (msg as unknown as { authorize: DerivAccount }).authorize;
+          ws.onopen = null; ws.onmessage = null; ws.onerror = null; ws.onclose = null;
           clearTimeout(timer);
-          if (msg.error) {
-            ws.close();
-            // Auth error is definitive — don't try more app_ids
-            reject(new Error(msg.error.message || 'Authorization failed'));
-          } else {
-            const account = (msg as unknown as { authorize: DerivAccount }).authorize;
-            // Hand off socket — don't close it
-            ws.onopen = null;
-            ws.onmessage = null;
-            ws.onerror = null;
-            ws.onclose = null;
-            clearTimeout(timer);
-            resolve({ ws, account });
-          }
-        } catch {
-          // ignore parse errors
+          resolve({ ws, account });
         }
       };
 
       ws.onerror = () => {
         clearTimeout(timer);
+        lastErr = `Connection error (app_id=${appId})`;
         tryNext();
-      };
-
-      ws.onclose = () => {
-        clearTimeout(timer);
-        // Only retry if we haven't resolved/rejected yet
       };
     };
 
@@ -222,65 +204,60 @@ function browserAuthorize(appId: string, token: string): Promise<{ ws: WebSocket
   });
 }
 
-// ─── Main client class ────────────────────────────────────────────────────────
+// ─── Main client ──────────────────────────────────────────────────────────────
 
 class DerivAPIClient {
   private ws: WebSocket | null = null;
-  private reqId = 2; // 1 is used by initial authorize
+  private reqId = 2;
   private pending = new Map<number, (msg: DerivMsg) => void>();
   private subs = new Map<string, MsgCb[]>();
   private token: string | null = null;
-  private _appId = '1089';
+  private _appId = '16929';
   private _authorized = false;
   private reconnTimer: ReturnType<typeof setTimeout> | null = null;
   private onDisconnectCbs: Array<() => void> = [];
 
-  // ── Public API ─────────────────────────────────────────────────────────────
-
-  /**
-   * Full connect+authorize flow.
-   * 1. Server verifies token and finds working app_id
-   * 2. Browser opens WS with that app_id and authorizes
-   */
   async connectWithToken(token: string): Promise<DerivAccount> {
     this.token = token;
     this._authorized = false;
     this.teardown();
 
-    // Step 1: server verify (handles Origin requirements, finds working app_id)
-    let verifiedAppId = '1089';
+    // Step 1: server-side verify (sets correct Origin, finds working app_id)
+    let verifiedAppId = '16929';
     let serverAccount: DerivAccount | null = null;
 
     try {
-      const { account, appId } = await serverVerifyToken(token);
-      verifiedAppId = appId;
-      serverAccount = account;
-    } catch (serverErr) {
-      // If server verify gives a clear auth error, surface it immediately
-      const msg = serverErr instanceof Error ? serverErr.message : String(serverErr);
-      const isAuthErr =
-        msg.toLowerCase().includes('invalid') ||
-        msg.toLowerCase().includes('authori') ||
-        msg.toLowerCase().includes('expired') ||
-        msg.toLowerCase().includes('rejected');
-      if (isAuthErr) throw serverErr;
-      // Network error on server — try browser WS directly
-      console.warn('Server verify failed (network?), trying browser WS directly:', msg);
+      const result = await serverVerify(token);
+      verifiedAppId = result.appId;
+      serverAccount = result.account;
+    } catch (err) {
+      // If server says token is definitely bad, throw immediately
+      const msg = err instanceof Error ? err.message : String(err);
+      const lower = msg.toLowerCase();
+      if (
+        lower.includes('invalid') ||
+        lower.includes('expired') ||
+        lower.includes('permission') ||
+        lower.includes('disabled') ||
+        lower.includes('read + trade') ||
+        lower.includes('api token')
+      ) {
+        throw err; // surface exact Deriv error
+      }
+      // Network issue on server — fall through to browser WS
+      console.warn('Server verify network issue, trying browser WS:', msg);
     }
 
-    // Step 2: open browser WebSocket + re-authorize for live data
+    // Step 2: browser WebSocket for live data
     try {
       const { ws, account } = await browserAuthorize(verifiedAppId, token);
       this.ws = ws;
       this._appId = verifiedAppId;
       this._authorized = true;
 
-      // Wire up ongoing message handling
       ws.onmessage = (evt) => {
-        try {
-          const msg = JSON.parse(evt.data as string) as DerivMsg;
-          this.dispatch(msg);
-        } catch { /* ignore */ }
+        try { this.dispatch(JSON.parse(evt.data as string) as DerivMsg); }
+        catch { /* */ }
       };
       ws.onerror = () => { this._authorized = false; };
       ws.onclose = (e) => {
@@ -291,36 +268,31 @@ class DerivAPIClient {
 
       return serverAccount || account;
     } catch (wsErr) {
-      // Browser WS failed — return server account if we have it
       if (serverAccount) {
-        // We verified the token works — WS just didn't open in browser
-        // This can happen in some browser environments; surface helpful error
+        // Token is valid (server confirmed) but browser WS failed
         throw new Error(
-          'Token is valid but browser WebSocket could not connect.\n' +
-          'Try: refreshing the page, disabling VPN, or using a different browser.'
+          'Token is valid but live connection failed.\n' +
+          'Try: refresh the page, disable VPN, or switch browser.'
         );
       }
       throw wsErr;
     }
   }
 
+  // Keep authorize() as alias for compatibility
   async authorize(token: string): Promise<DerivAccount> {
     return this.connectWithToken(token);
   }
 
-  // ── Internal ───────────────────────────────────────────────────────────────
-
   private teardown() {
     if (this.reconnTimer) { clearTimeout(this.reconnTimer); this.reconnTimer = null; }
     if (this.ws) {
-      this.ws.onopen = null;
-      this.ws.onmessage = null;
-      this.ws.onerror = null;
-      this.ws.onclose = null;
+      this.ws.onopen = null; this.ws.onmessage = null;
+      this.ws.onerror = null; this.ws.onclose = null;
       try { this.ws.close(1000); } catch { /* */ }
       this.ws = null;
     }
-    this.pending.forEach((_, id) => this.pending.delete(id));
+    this.pending.clear();
     this.subs.clear();
   }
 
@@ -350,28 +322,25 @@ class DerivAPIClient {
   private send<T>(payload: Record<string, unknown>): Promise<T & DerivMsg> {
     return new Promise((resolve, reject) => {
       if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-        reject(new Error('WebSocket not connected'));
+        reject(new Error('Not connected to Deriv'));
         return;
       }
       const id = this.reqId++;
       payload.req_id = id;
-
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error('Request timed out'));
       }, 30000);
-
       this.pending.set(id, (msg) => {
         clearTimeout(timer);
         if (msg.error) reject(new Error(msg.error.message || 'Deriv API error'));
         else resolve(msg as T & DerivMsg);
       });
-
       this.ws!.send(JSON.stringify(payload));
     });
   }
 
-  // ── Market data ────────────────────────────────────────────────────────────
+  // ── Market ────────────────────────────────────────────────────────────────
 
   async getActiveSymbols(): Promise<ActiveSymbol[]> {
     const r = await this.send<{ active_symbols: ActiveSymbol[] }>({ active_symbols: 'brief', product_type: 'basic' });
@@ -391,9 +360,7 @@ class DerivAPIClient {
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify({ ticks: symbol, subscribe: 1, req_id: id }));
     }
-    return () => {
-      this.subs.set('tick', (this.subs.get('tick') || []).filter(h => h !== handler));
-    };
+    return () => { this.subs.set('tick', (this.subs.get('tick') || []).filter(h => h !== handler)); };
   }
 
   async getTickHistory(symbol: string, count = 200): Promise<TickHistory> {
@@ -406,7 +373,7 @@ class DerivAPIClient {
     return r.candles || [];
   }
 
-  // ── Account ────────────────────────────────────────────────────────────────
+  // ── Account ───────────────────────────────────────────────────────────────
 
   async getBalance(): Promise<{ balance: number; currency: string; loginid: string }> {
     const r = await this.send<{ balance: { balance: number; currency: string; loginid: string } }>({ balance: 1 });
@@ -426,9 +393,7 @@ class DerivAPIClient {
     if (this.ws?.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify({ balance: 1, subscribe: 1, req_id: id }));
     }
-    return () => {
-      this.subs.set('balance', (this.subs.get('balance') || []).filter(h => h !== handler));
-    };
+    return () => { this.subs.set('balance', (this.subs.get('balance') || []).filter(h => h !== handler)); };
   }
 
   async getPortfolio(): Promise<PortfolioContract[]> {
@@ -446,7 +411,7 @@ class DerivAPIClient {
     return r.profit_table?.transactions || [];
   }
 
-  // ── Trading ────────────────────────────────────────────────────────────────
+  // ── Trading ───────────────────────────────────────────────────────────────
 
   async getProposal(p: ProposalParams): Promise<ContractProposal> {
     const r = await this.send<{ proposal: ContractProposal }>({
@@ -466,7 +431,7 @@ class DerivAPIClient {
     return this.send({ sell: contractId, price: 0 });
   }
 
-  // ── Lifecycle ──────────────────────────────────────────────────────────────
+  // ── Lifecycle ─────────────────────────────────────────────────────────────
 
   onDisconnect(cb: () => void) { this.onDisconnectCbs.push(cb); }
 
