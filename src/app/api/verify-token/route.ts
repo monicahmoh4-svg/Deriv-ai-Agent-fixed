@@ -1,17 +1,17 @@
 /**
  * POST /api/verify-token
- * Server-side Deriv token verification.
  *
- * Runs in Node.js on Vercel so we can set Origin headers that Deriv's
- * WebSocket server accepts — bypassing the browser Origin restriction.
- * Tries multiple app_id / Origin combinations until one authorizes.
+ * Server-side Deriv token verification using Node 18+ built-in WebSocket.
+ * No external packages required — zero dependencies.
+ *
+ * Runs on Vercel (Node 18+) so we can set Origin headers that Deriv accepts,
+ * bypassing the browser Origin restriction for pat_def... tokens.
  */
 import { NextRequest, NextResponse } from 'next/server';
-import WebSocket from 'ws';
 
 const WS_ENDPOINT = 'wss://ws.binaryws.com/websockets/v3';
 
-// Each app_id is registered by Deriv for a specific origin domain
+// Each Deriv app_id is whitelisted for a specific Origin domain
 const ATTEMPTS = [
   { appId: '1089',  origin: 'https://deriv.com' },
   { appId: '36544', origin: 'https://smarttrader.deriv.com' },
@@ -37,38 +37,40 @@ interface DerivMsg {
   [key: string]: unknown;
 }
 
-function tryAuthorize(
-  appId: string,
-  origin: string,
-  token: string
-): Promise<DerivAccount> {
+function tryAuthorize(appId: string, origin: string, token: string): Promise<DerivAccount> {
   return new Promise((resolve, reject) => {
     const url = `${WS_ENDPOINT}?app_id=${appId}&l=EN&brand=deriv`;
+
+    // Use Node 18+ global WebSocket with Origin header
+    // @ts-expect-error – Node 18 global WebSocket accepts a headers option not in browser spec
     const ws = new WebSocket(url, { headers: { Origin: origin } });
 
     const timer = setTimeout(() => {
-      ws.terminate();
+      try { ws.close(); } catch { /* */ }
       reject(new Error(`Timeout (app_id=${appId})`));
     }, 12000);
 
-    ws.on('open', () => {
+    ws.onopen = () => {
       ws.send(JSON.stringify({ authorize: token, req_id: 1 }));
-    });
+    };
 
-    ws.on('message', (raw) => {
-      clearTimeout(timer);
+    ws.onmessage = (evt: MessageEvent<string>) => {
       let msg: DerivMsg;
       try {
-        msg = JSON.parse(raw.toString()) as DerivMsg;
+        msg = JSON.parse(evt.data) as DerivMsg;
       } catch {
-        ws.terminate();
+        clearTimeout(timer);
+        try { ws.close(); } catch { /* */ }
         reject(new Error('Invalid JSON from Deriv'));
         return;
       }
 
+      // Ignore non-authorize messages
       if (msg.msg_type !== 'authorize') return;
 
-      ws.close();
+      clearTimeout(timer);
+      try { ws.close(); } catch { /* */ }
+
       if (msg.error) {
         reject(new Error(msg.error.message || msg.error.code || 'Authorization failed'));
       } else if (msg.authorize) {
@@ -76,17 +78,21 @@ function tryAuthorize(
       } else {
         reject(new Error('Empty authorize response'));
       }
-    });
+    };
 
-    ws.on('error', (err) => {
+    ws.onerror = () => {
       clearTimeout(timer);
-      reject(new Error(`WS error (app_id=${appId}): ${err.message}`));
-    });
+      reject(new Error(`Connection failed (app_id=${appId})`));
+    };
+
+    ws.onclose = () => {
+      clearTimeout(timer);
+    };
   });
 }
 
 export async function POST(req: NextRequest) {
-  // Parse body
+  // Parse + validate token
   let token: string;
   try {
     const body = await req.json() as { token?: string };
@@ -101,7 +107,7 @@ export async function POST(req: NextRequest) {
 
   if (token.length < 15) {
     return NextResponse.json(
-      { error: 'Token too short — please copy the full token from Deriv' },
+      { error: 'Token appears incomplete — please copy the full token from Deriv' },
       { status: 400 }
     );
   }
@@ -115,7 +121,7 @@ export async function POST(req: NextRequest) {
     } catch (err) {
       lastError = err instanceof Error ? err.message : String(err);
 
-      // Definitive auth failure — no point trying more app_ids
+      // Definitive auth failure — token itself is wrong, stop trying
       const lower = lastError.toLowerCase();
       if (
         lower.includes('invalid token') ||
@@ -127,7 +133,7 @@ export async function POST(req: NextRequest) {
       ) {
         break;
       }
-      // Network / timeout — try next
+      // Network / timeout — try next app_id
     }
   }
 
@@ -140,7 +146,7 @@ export async function POST(req: NextRequest) {
     {
       error: isAuthErr
         ? 'Token rejected by Deriv. Ensure it has Read + Trade permissions and is copied in full.'
-        : `Could not reach Deriv servers: ${lastError}`,
+        : `Could not reach Deriv: ${lastError}`,
     },
     { status: 401 }
   );
