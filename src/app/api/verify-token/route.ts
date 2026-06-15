@@ -1,75 +1,84 @@
 /**
- * Server-side Deriv token verification endpoint
- * POST /api/verify-token  { token: string }
+ * POST /api/verify-token
+ * Server-side Deriv token verification.
  *
- * This runs on the server (Node.js) where we can set Origin headers
- * and bypass browser CORS restrictions. Returns account info if valid.
+ * Runs in Node.js on Vercel so we can set Origin headers that Deriv's
+ * WebSocket server accepts — bypassing the browser Origin restriction.
+ * Tries multiple app_id / Origin combinations until one authorizes.
  */
 import { NextRequest, NextResponse } from 'next/server';
+import WebSocket from 'ws';
 
 const WS_ENDPOINT = 'wss://ws.binaryws.com/websockets/v3';
 
-// App IDs to try in order — server-side can set any Origin header
-const APP_IDS = ['1089', '36544', '16929'];
+// Each app_id is registered by Deriv for a specific origin domain
+const ATTEMPTS = [
+  { appId: '1089',  origin: 'https://deriv.com' },
+  { appId: '36544', origin: 'https://smarttrader.deriv.com' },
+  { appId: '16929', origin: 'https://app.deriv.com' },
+];
 
-// Deriv-accepted origins that pass their origin whitelist for these app_ids
-const ORIGIN_FOR_APP: Record<string, string> = {
-  '1089':  'https://deriv.com',
-  '36544': 'https://smarttrader.deriv.com',
-  '16929': 'https://app.deriv.com',
-};
-
-interface DerivAuthResult {
+interface DerivAccount {
   loginid: string;
-  email: string;
-  fullname: string;
-  balance: number;
-  currency: string;
-  is_virtual: number;
-  account_type: string;
-  landing_company_name: string;
+  email?: string;
+  fullname?: string;
+  balance?: number;
+  currency?: string;
+  is_virtual?: number;
+  account_type?: string;
+  landing_company_name?: string;
 }
 
-function tryAuthorize(appId: string, token: string): Promise<DerivAuthResult> {
+interface DerivMsg {
+  msg_type: string;
+  req_id?: number;
+  error?: { code: string; message: string };
+  authorize?: DerivAccount;
+  [key: string]: unknown;
+}
+
+function tryAuthorize(
+  appId: string,
+  origin: string,
+  token: string
+): Promise<DerivAccount> {
   return new Promise((resolve, reject) => {
     const url = `${WS_ENDPOINT}?app_id=${appId}&l=EN&brand=deriv`;
-    const origin = ORIGIN_FOR_APP[appId] || 'https://deriv.com';
-
-    // Dynamic import of 'ws' — only runs server-side
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const wsModule = require('ws');
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const WS = (wsModule.default || wsModule) as any;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const ws: any = new WS(url, { headers: { Origin: origin } });
+    const ws = new WebSocket(url, { headers: { Origin: origin } });
 
     const timer = setTimeout(() => {
       ws.terminate();
-      reject(new Error(`Timeout with app_id=${appId}`));
-    }, 10000);
+      reject(new Error(`Timeout (app_id=${appId})`));
+    }, 12000);
 
     ws.on('open', () => {
       ws.send(JSON.stringify({ authorize: token, req_id: 1 }));
     });
 
-    ws.on('message', (raw: Buffer) => {
+    ws.on('message', (raw) => {
       clearTimeout(timer);
+      let msg: DerivMsg;
       try {
-        const msg = JSON.parse(raw.toString());
-        if (msg.error) {
-          ws.close();
-          reject(new Error(msg.error.message || msg.error.code || 'Authorization failed'));
-        } else if (msg.msg_type === 'authorize' && msg.authorize) {
-          ws.close();
-          resolve(msg.authorize as DerivAuthResult);
-        }
+        msg = JSON.parse(raw.toString()) as DerivMsg;
       } catch {
-        ws.close();
-        reject(new Error('Invalid response from Deriv'));
+        ws.terminate();
+        reject(new Error('Invalid JSON from Deriv'));
+        return;
+      }
+
+      if (msg.msg_type !== 'authorize') return;
+
+      ws.close();
+      if (msg.error) {
+        reject(new Error(msg.error.message || msg.error.code || 'Authorization failed'));
+      } else if (msg.authorize) {
+        resolve(msg.authorize);
+      } else {
+        reject(new Error('Empty authorize response'));
       }
     });
 
-    ws.on('error', (err: Error) => {
+    ws.on('error', (err) => {
       clearTimeout(timer);
       reject(new Error(`WS error (app_id=${appId}): ${err.message}`));
     });
@@ -77,56 +86,61 @@ function tryAuthorize(appId: string, token: string): Promise<DerivAuthResult> {
 }
 
 export async function POST(req: NextRequest) {
-  let body: { token?: string };
+  // Parse body
+  let token: string;
   try {
-    body = await req.json();
+    const body = await req.json() as { token?: string };
+    token = (body?.token ?? '').trim();
   } catch {
     return NextResponse.json({ error: 'Invalid request body' }, { status: 400 });
   }
 
-  const token = body?.token?.trim();
   if (!token) {
-    return NextResponse.json({ error: 'Token is required' }, { status: 400 });
+    return NextResponse.json({ error: 'token is required' }, { status: 400 });
   }
 
-  // Basic format check — pat_ tokens are long strings
-  if (token.length < 10) {
-    return NextResponse.json({ error: 'Token appears too short — please copy the full token' }, { status: 400 });
+  if (token.length < 15) {
+    return NextResponse.json(
+      { error: 'Token too short — please copy the full token from Deriv' },
+      { status: 400 }
+    );
   }
 
   let lastError = 'Authorization failed';
 
-  for (const appId of APP_IDS) {
+  for (const { appId, origin } of ATTEMPTS) {
     try {
-      const account = await tryAuthorize(appId, token);
-      return NextResponse.json({
-        success: true,
-        account,
-        appId,
-      });
+      const account = await tryAuthorize(appId, origin, token);
+      return NextResponse.json({ success: true, account, appId });
     } catch (err) {
-      lastError = err instanceof Error ? err.message : 'Failed';
-      // If it's a definitive auth error (not network), stop trying
-      const msg = lastError.toLowerCase();
+      lastError = err instanceof Error ? err.message : String(err);
+
+      // Definitive auth failure — no point trying more app_ids
+      const lower = lastError.toLowerCase();
       if (
-        msg.includes('invalid token') ||
-        msg.includes('invalidtoken') ||
-        msg.includes('authorizationfailed') ||
-        msg.includes('authorization failed') ||
-        msg.includes('token expired')
+        lower.includes('invalid token') ||
+        lower.includes('invalidtoken') ||
+        lower.includes('authorizationfailed') ||
+        lower.includes('authorization failed') ||
+        lower.includes('token expired') ||
+        lower.includes('permission denied')
       ) {
-        break; // Token itself is invalid — no point trying other app_ids
+        break;
       }
-      // Network/timeout error — try next app_id
+      // Network / timeout — try next
     }
   }
 
+  const isAuthErr =
+    lastError.toLowerCase().includes('invalid') ||
+    lastError.toLowerCase().includes('authori') ||
+    lastError.toLowerCase().includes('expired');
+
   return NextResponse.json(
     {
-      error: lastError,
-      hint: lastError.toLowerCase().includes('invalid')
+      error: isAuthErr
         ? 'Token rejected by Deriv. Ensure it has Read + Trade permissions and is copied in full.'
-        : 'Could not connect to Deriv. Check your internet connection.',
+        : `Could not reach Deriv servers: ${lastError}`,
     },
     { status: 401 }
   );
