@@ -24,7 +24,7 @@ export function useTradingEngine() {
   const balUnsub = useRef<(() => void) | null>(null);
   const connecting = useRef(false);
 
-  // ── connect ──────────────────────────────────────────────────────────────
+  // ── connect ───────────────────────────────────────────────────────────────
 
   const connect = useCallback(async (token: string) => {
     if (connecting.current) return;
@@ -35,14 +35,14 @@ export function useTradingEngine() {
       resetDerivClient();
       const client = getDerivClient();
 
-      // connectWithToken: server-verifies then opens browser WS
-      // supports pat_def... and legacy tokens
+      // Pure browser WebSocket — tries all app_ids until one works
+      // No server proxy needed — browser Origin header is accepted by Deriv
       const account = await client.connectWithToken(token);
 
       setActiveAccount(account);
       setConnectionStatus('authorized');
 
-      // Live balance subscription
+      // Live balance
       try {
         const bal = await client.getBalance();
         setBalance(bal.balance, bal.currency);
@@ -52,13 +52,13 @@ export function useTradingEngine() {
         );
       } catch { /* non-fatal */ }
 
-      // Active symbols list
+      // Symbols list
       try {
         const syms = await client.getActiveSymbols();
         setSymbols(syms);
       } catch { /* non-fatal */ }
 
-      // Portfolio + transaction history
+      // Portfolio + history
       try {
         const [portfolio, txs] = await Promise.allSettled([
           client.getPortfolio(),
@@ -70,25 +70,12 @@ export function useTradingEngine() {
 
       addNotification({
         type: 'success',
-        title: 'Connected to Deriv',
-        message: `${account.is_virtual === 1 ? '🟡 DEMO' : '🟢 REAL'} • ${account.loginid}`,
+        title: 'Connected to Deriv ✓',
+        message: `${account.is_virtual === 1 ? '🟡 DEMO' : '🟢 REAL'} • ${account.loginid} • app_id=${client.usedAppId}`,
       });
+
     } catch (err) {
-      const raw = err instanceof Error ? err.message : String(err);
-      let msg = raw;
-      if (
-        raw.toLowerCase().includes('invalid') ||
-        raw.toLowerCase().includes('token') ||
-        raw.toLowerCase().includes('authori')
-      ) {
-        msg =
-          'Token rejected by Deriv.\n' +
-          '• Make sure you copied the full token (pat_def… tokens are long)\n' +
-          '• Token needs Read + Trade permissions\n' +
-          '• Create tokens at app.deriv.com → Account Settings → API Token';
-      } else if (raw.toLowerCase().includes('timeout')) {
-        msg = 'Connection timed out — check your internet and try again.';
-      }
+      const msg = err instanceof Error ? err.message : String(err);
       setConnectionStatus('error', msg);
       addNotification({ type: 'error', title: 'Connection Failed', message: msg });
       resetDerivClient();
@@ -135,10 +122,7 @@ export function useTradingEngine() {
         if (!autonomousMode || signal.direction === 'NEUTRAL') continue;
         if (signal.confidence < riskSettings.minConfidence) continue;
         if (dailyPnl <= -riskSettings.maxDailyLoss) continue;
-        if (
-          Date.now() - (cooldowns.get(symbol) || 0) <
-          riskSettings.cooldownSeconds * 1000
-        ) continue;
+        if (Date.now() - (cooldowns.get(symbol) || 0) < riskSettings.cooldownSeconds * 1000) continue;
         const { openContracts } = useTradingStore.getState();
         if (openContracts.length >= riskSettings.maxConcurrentTrades) continue;
 
@@ -150,12 +134,9 @@ export function useTradingEngine() {
           signal.confidence,
           'auto'
         );
-      } catch { /* skip symbol on error */ }
+      } catch { /* skip symbol */ }
     }
-  }, [
-    connectionStatus, selectedSymbols, autonomousMode,
-    riskSettings, dailyPnl, setSignal,
-  ]);
+  }, [connectionStatus, selectedSymbols, autonomousMode, riskSettings, dailyPnl, setSignal]);
 
   // ── execute trade ─────────────────────────────────────────────────────────
 
@@ -169,11 +150,7 @@ export function useTradingEngine() {
     durationUnit?: 't' | 'm',
   ): Promise<TradeRecord | null> => {
     if (connectionStatus !== 'authorized') {
-      addNotification({
-        type: 'error',
-        title: 'Not Connected',
-        message: 'Connect your Deriv account first.',
-      });
+      addNotification({ type: 'error', title: 'Not Connected', message: 'Connect your Deriv account first.' });
       return null;
     }
 
@@ -191,10 +168,8 @@ export function useTradingEngine() {
 
     try {
       const proposal = await client.getProposal({
-        symbol, amount: stake,
-        contract_type: direction,
-        duration: dur,
-        duration_unit: durUnit,
+        symbol, amount: stake, contract_type: direction,
+        duration: dur, duration_unit: durUnit,
       });
       const buy = await client.buyContract(proposal.id, proposal.ask_price);
       setBalance(buy.balance_after);
@@ -221,10 +196,7 @@ export function useTradingEngine() {
       updateStats();
       return null;
     }
-  }, [
-    connectionStatus, addTrade, updateTrade,
-    setBalance, addNotification, updateStats,
-  ]);
+  }, [connectionStatus, addTrade, updateTrade, setBalance, addNotification, updateStats]);
 
   // ── monitor contract ──────────────────────────────────────────────────────
 
@@ -262,7 +234,7 @@ export function useTradingEngine() {
     setTimeout(poll, 2000);
   }, [setOpenContracts, updateTrade, addNotification, updateStats, setBalance]);
 
-  // ── auto-connect on mount if tokens saved ─────────────────────────────────
+  // ── auto-connect saved tokens on mount ────────────────────────────────────
 
   useEffect(() => {
     const { tokens, connectionStatus: cs } = useTradingStore.getState();
@@ -284,15 +256,13 @@ export function useTradingEngine() {
     };
   }, [connectionStatus, selectedSymbols, subscribeSymbols]);
 
-  // ── run analysis loop ─────────────────────────────────────────────────────
+  // ── analysis loop ─────────────────────────────────────────────────────────
 
   useEffect(() => {
     if (connectionStatus !== 'authorized') return;
     runAnalysis();
     analysisTimer.current = setInterval(runAnalysis, ANALYSIS_INTERVAL_MS);
-    return () => {
-      if (analysisTimer.current) clearInterval(analysisTimer.current);
-    };
+    return () => { if (analysisTimer.current) clearInterval(analysisTimer.current); };
   }, [connectionStatus, runAnalysis]);
 
   return { connect, executeTrade };
