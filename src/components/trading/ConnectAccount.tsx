@@ -1,6 +1,6 @@
 'use client';
 import { useState } from 'react';
-import { Link2, Shield, Eye, EyeOff, Loader2, X, CheckCircle2, ExternalLink, AlertCircle, ChevronDown, ChevronUp } from 'lucide-react';
+import { Link2, Shield, Eye, EyeOff, Loader2, X, CheckCircle2, ExternalLink, AlertCircle, ChevronDown, ChevronUp, Info } from 'lucide-react';
 import { useTradingStore } from '@/store/trading-store';
 import { useTradingEngine } from '@/hooks/useTradingEngine';
 import { resetDerivClient } from '@/lib/deriv-api';
@@ -8,6 +8,12 @@ import OAuthLogin from './OAuthLogin';
 import AccountSelector from './AccountSelector';
 
 interface Props { onClose?: () => void; }
+
+// app_ids are always numeric (e.g. 1089, 16929, 36544)
+// pat_ tokens and legacy tokens are alphanumeric, 15-40+ chars
+function looksLikeAppId(value: string): boolean {
+  return /^\d{1,8}$/.test(value.trim());
+}
 
 export default function ConnectAccount({ onClose }: Props) {
   const [token, setToken] = useState('');
@@ -24,14 +30,28 @@ export default function ConnectAccount({ onClose }: Props) {
   const handleConnect = async () => {
     const t = token.trim();
     if (!t) return;
+
+    // Catch common mistake: pasting app_id instead of API token
+    if (looksLikeAppId(t)) {
+      setError(
+        `"${t}" looks like an App ID, not an API token.\n\n` +
+        'An API token is a longer string (like pat_def1dcdcc1d... or a 20+ character code).\n' +
+        'Get it from: app.deriv.com → Account Settings → API Token\n\n' +
+        'App IDs (numbers like 1089, 36544) go in Vercel environment variables, not here.'
+      );
+      return;
+    }
+
     setError('');
     setLoading(true);
     try {
+      // For manual token entry, we don't have accountId yet —
+      // connectWithToken will authorize and discover it via legacy WS flow
       await connect(t);
       await new Promise(r => setTimeout(r, 400));
       const { connectionStatus, activeAccount, connectionError } = useTradingStore.getState();
       if (connectionStatus === 'authorized' && activeAccount) {
-        store.addToken(activeAccount.loginid, t, activeAccount.is_virtual === 1);
+        store.addToken(activeAccount.loginid, t, activeAccount.is_virtual === 1, activeAccount.currency);
         setToken('');
         onClose?.();
       } else {
@@ -68,7 +88,7 @@ export default function ConnectAccount({ onClose }: Props) {
         {onClose && <button onClick={onClose} style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#8098b8' }}><X size={18} /></button>}
       </div>
 
-      {/* If accounts already connected — show account selector */}
+      {/* If accounts already connected */}
       {hasAccounts && (
         <div style={{ marginBottom: 20 }}>
           <AccountSelector onClose={onClose} />
@@ -78,39 +98,44 @@ export default function ConnectAccount({ onClose }: Props) {
         </div>
       )}
 
-      {/* OAuth Login — PRIMARY option */}
+      {/* OAuth Login — primary */}
       <div style={{ marginBottom: 16 }}>
         <OAuthLogin />
       </div>
 
-      {/* Divider */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 16 }}>
         <div style={{ flex: 1, height: 1, background: '#1e2d45' }} />
         <span style={{ fontSize: 11, color: '#3d5270', fontWeight: 600 }}>OR</span>
         <div style={{ flex: 1, height: 1, background: '#1e2d45' }} />
       </div>
 
-      {/* Manual token — SECONDARY option (collapsible) */}
+      {/* Manual token entry */}
       <div style={{ background: '#0f1520', border: '1px solid #1e2d45', borderRadius: 10, overflow: 'hidden' }}>
         <button
           onClick={() => setShowManual(!showManual)}
-          style={{
-            width: '100%', padding: '12px 16px', background: 'none', border: 'none',
-            cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'space-between',
-            color: '#8098b8',
-          }}
+          style={{ width: '100%', padding: '12px 16px', background: 'none', border: 'none', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'space-between', color: '#8098b8' }}
         >
-          <span style={{ fontSize: 13, fontWeight: 600 }}>Use API Token manually</span>
+          <span style={{ fontSize: 13, fontWeight: 600 }}>Use API Token manually (recommended if popup doesn't work)</span>
           {showManual ? <ChevronUp size={15} /> : <ChevronDown size={15} />}
         </button>
 
         {showManual && (
           <div style={{ padding: '0 16px 16px' }}>
-            {/* How to get token */}
+            {/* Critical distinction note */}
+            <div style={{ background: '#ffd60008', border: '1px solid #ffd60022', borderRadius: 8, padding: '10px 12px', marginBottom: 12 }}>
+              <p style={{ margin: 0, fontSize: 11, color: '#ffd600', fontWeight: 700, display: 'flex', alignItems: 'center', gap: 5 }}>
+                <Info size={12} /> App ID ≠ API Token
+              </p>
+              <p style={{ margin: '4px 0 0', fontSize: 11, color: '#8098b8', lineHeight: 1.6 }}>
+                <strong style={{ color: '#e8f0fe' }}>App ID</strong> is a number (e.g. 36544) used in the website's setup — it goes in Vercel env vars, not here.<br />
+                <strong style={{ color: '#e8f0fe' }}>API Token</strong> is what you paste below — get it from your Deriv account settings.
+              </p>
+            </div>
+
             <div style={{ background: '#00c2ff08', border: '1px solid #00c2ff1a', borderRadius: 8, padding: '10px 12px', marginBottom: 12 }}>
-              <p style={{ margin: '0 0 4px', fontSize: 11, fontWeight: 700, color: '#00c2ff' }}>Get token from Deriv:</p>
+              <p style={{ margin: '0 0 4px', fontSize: 11, fontWeight: 700, color: '#00c2ff' }}>Get your API token:</p>
               <p style={{ margin: 0, fontSize: 11, color: '#8098b8', lineHeight: 1.7 }}>
-                app.deriv.com → Account Settings → <strong style={{ color: '#e8f0fe' }}>API Token</strong> → Create with <strong style={{ color: '#e8f0fe' }}>Read + Trade</strong>
+                app.deriv.com → Account Settings → <strong style={{ color: '#e8f0fe' }}>API Token</strong> → Create with <strong style={{ color: '#e8f0fe' }}>Read + Trade</strong> permissions
               </p>
               <a href="https://app.deriv.com/account/api-token" target="_blank" rel="noopener noreferrer"
                 style={{ display: 'inline-flex', alignItems: 'center', gap: 4, marginTop: 6, fontSize: 11, color: '#00c2ff', textDecoration: 'none', fontWeight: 600 }}>
@@ -118,14 +143,13 @@ export default function ConnectAccount({ onClose }: Props) {
               </a>
             </div>
 
-            {/* Input */}
             <div style={{ position: 'relative', marginBottom: 10 }}>
               <input
                 type={show ? 'text' : 'password'}
                 value={token}
                 onChange={e => { setToken(e.target.value); setError(''); }}
                 onKeyDown={e => e.key === 'Enter' && !loading && handleConnect()}
-                placeholder="pat_def1dcdcc1d… (paste full token)"
+                placeholder="pat_def1dcdcc1d… or legacy token"
                 autoComplete="off"
                 spellCheck={false}
                 style={{
@@ -167,7 +191,7 @@ export default function ConnectAccount({ onClose }: Props) {
         )}
       </div>
 
-      {/* Remove saved accounts */}
+      {/* Saved tokens */}
       {hasAccounts && (
         <div style={{ marginTop: 16 }}>
           <p style={{ margin: '0 0 8px', fontSize: 11, fontWeight: 600, color: '#3d5270', textTransform: 'uppercase', letterSpacing: '0.08em' }}>Saved Tokens</p>
@@ -186,7 +210,6 @@ export default function ConnectAccount({ onClose }: Props) {
         </div>
       )}
 
-      {/* Security note */}
       <div style={{ display: 'flex', alignItems: 'flex-start', gap: 6, marginTop: 14 }}>
         <Shield size={11} color="#3d5270" style={{ marginTop: 2, flexShrink: 0 }} />
         <p style={{ margin: 0, fontSize: 11, color: '#3d5270', lineHeight: 1.5 }}>
