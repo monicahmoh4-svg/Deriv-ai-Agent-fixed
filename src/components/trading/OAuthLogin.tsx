@@ -1,36 +1,28 @@
 'use client';
 /**
- * OAuth Login — "Login with Deriv"
+ * Login with Deriv — OAuth 2.0 button
+ * Redirects to Deriv's official OAuth page.
+ * After login, Deriv sends all accounts + tokens to /callback.
  *
- * Uses app_id=16929 (app.deriv.com) which is Deriv's own app and
- * supports passing redirect_uri directly in the URL — no app registration needed.
- * After login Deriv redirects to /callback with all account tokens.
+ * IMPORTANT: For the OAuth redirect to work after login,
+ * your app_id must be registered at developers.deriv.com
+ * with this site's URL as the OAuth redirect URI.
  */
 import { useState } from 'react';
-import { Loader2, ShieldCheck, ExternalLink } from 'lucide-react';
+import { ExternalLink, Loader2, ShieldCheck, Info } from 'lucide-react';
 
 const OAUTH_BASE = 'https://oauth.deriv.com/oauth2/authorize';
-
-// Use env var if set (user's own registered app), otherwise use Deriv's own app_id
-// app_id=16929 = app.deriv.com — works with redirect_uri param for any domain
-const APP_ID = process.env.NEXT_PUBLIC_DERIV_APP_ID || '16929';
+const APP_ID = process.env.NEXT_PUBLIC_DERIV_APP_ID || '36544';
 
 function buildOAuthURL(): string {
-  const redirectUri = typeof window !== 'undefined'
-    ? `${window.location.origin}/callback`
-    : '';
-
+  if (typeof window === 'undefined') return OAUTH_BASE;
+  const redirectUri = `${window.location.origin}/callback`;
   const params = new URLSearchParams({
     app_id: APP_ID,
     l: 'EN',
     brand: 'deriv',
+    redirect_uri: redirectUri,
   });
-
-  // Pass redirect_uri so Deriv knows where to send the user back
-  if (redirectUri) {
-    params.set('redirect_uri', redirectUri);
-  }
-
   return `${OAUTH_BASE}?${params.toString()}`;
 }
 
@@ -39,71 +31,57 @@ export default function OAuthLogin() {
 
   const handleLogin = () => {
     setLoading(true);
-    const url = buildOAuthURL();
-    window.location.href = url;
+    window.location.href = buildOAuthURL();
   };
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-
-      {/* Login button — always enabled, no setup required */}
+      {/* Primary login button */}
       <button
         onClick={handleLogin}
         disabled={loading}
         style={{
-          width: '100%',
-          padding: '14px 20px',
-          borderRadius: 10,
-          background: loading
-            ? '#1e2d45'
-            : 'linear-gradient(135deg, #ff444f, #c90000)',
+          width: '100%', padding: '14px 20px', borderRadius: 10,
+          background: loading ? '#1e2d45' : 'linear-gradient(135deg,#ff444f,#c90000)',
           border: 'none',
           color: loading ? '#3d5270' : '#fff',
-          fontSize: 15,
-          fontWeight: 700,
+          fontSize: 15, fontWeight: 700,
           cursor: loading ? 'not-allowed' : 'pointer',
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'center',
-          gap: 10,
+          display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10,
+          boxShadow: loading ? 'none' : '0 4px 24px rgba(255,68,79,0.3)',
           transition: 'all 0.2s',
-          boxShadow: loading ? 'none' : '0 4px 24px rgba(255,68,79,0.35)',
-          letterSpacing: '-0.01em',
         }}
       >
         {loading ? (
-          <>
-            <Loader2 size={18} style={{ animation: 'spin 1s linear infinite' }} />
-            Redirecting to Deriv…
-          </>
+          <><Loader2 size={18} style={{ animation: 'spin 1s linear infinite' }} /> Redirecting to Deriv…</>
         ) : (
           <>
-            {/* Deriv D logo */}
-            <span style={{
-              width: 26, height: 26, borderRadius: 6,
-              background: 'rgba(255,255,255,0.2)',
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-              fontSize: 14, fontWeight: 900, flexShrink: 0,
-            }}>D</span>
+            <span style={{ width: 26, height: 26, borderRadius: 6, background: 'rgba(255,255,255,0.2)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 14, fontWeight: 900, flexShrink: 0 }}>D</span>
             Login with Deriv
-            <ExternalLink size={14} style={{ opacity: 0.7, marginLeft: 2 }} />
+            <ExternalLink size={14} style={{ opacity: 0.7 }} />
           </>
         )}
       </button>
 
-      {/* Trust note */}
-      <div style={{
-        display: 'flex', alignItems: 'flex-start', gap: 7,
-        padding: '9px 12px', borderRadius: 8,
-        background: '#00e67608', border: '1px solid #00e67622',
-      }}>
+      {/* Security note */}
+      <div style={{ display: 'flex', alignItems: 'flex-start', gap: 7, padding: '9px 12px', borderRadius: 8, background: '#00e67608', border: '1px solid #00e67622' }}>
         <ShieldCheck size={13} color="#00e676" style={{ flexShrink: 0, marginTop: 1 }} />
         <p style={{ margin: 0, fontSize: 11, color: '#8098b8', lineHeight: 1.6 }}>
-          You will be taken to <strong style={{ color: '#e8f0fe' }}>Deriv's official website</strong> to log in.
-          Your credentials are never entered in or seen by this app.
-          After login you will be sent back here automatically.
+          You log in on <strong style={{ color: '#e8f0fe' }}>Deriv's official site</strong>. Your password never touches this app. After login you are automatically redirected back here with all your accounts connected.
         </p>
       </div>
+
+      {/* Setup note for custom app_id */}
+      {APP_ID === '36544' && (
+        <div style={{ display: 'flex', alignItems: 'flex-start', gap: 7, padding: '8px 12px', borderRadius: 8, background: '#ffd60008', border: '1px solid #ffd60022' }}>
+          <Info size={12} color="#ffd600" style={{ flexShrink: 0, marginTop: 1 }} />
+          <p style={{ margin: 0, fontSize: 10, color: '#8098b8', lineHeight: 1.5 }}>
+            For production: register your own app_id at{' '}
+            <a href="https://developers.deriv.com" target="_blank" rel="noopener noreferrer" style={{ color: '#ffd600' }}>developers.deriv.com</a>
+            {' '}and set <code style={{ color: '#e8f0fe', background: '#1e2d45', padding: '1px 4px', borderRadius: 3 }}>NEXT_PUBLIC_DERIV_APP_ID</code> in Vercel.
+          </p>
+        </div>
+      )}
 
       <style>{`@keyframes spin{from{transform:rotate(0)}to{transform:rotate(360deg)}}`}</style>
     </div>
