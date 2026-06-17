@@ -1,4 +1,11 @@
 'use client';
+/**
+ * Deriv Trading Engine
+ * Uses official Deriv API v2:
+ *   - REST /api/deriv-otp to get authenticated WS URL
+ *   - WebSocket for all real-time trading operations
+ *   - Balance subscription keeps app in sync with real Deriv account
+ */
 import { useEffect, useRef, useCallback } from 'react';
 import { getDerivClient, resetDerivClient } from '@/lib/deriv-api';
 import { analyzeMarket, historyToPrices } from '@/lib/trading-engine';
@@ -26,7 +33,11 @@ export function useTradingEngine() {
 
   // ── connect ───────────────────────────────────────────────────────────────
 
-  const connect = useCallback(async (token: string) => {
+  const connect = useCallback(async (
+    token: string,
+    accountId?: string,
+    accountType: 'real' | 'demo' = 'demo'
+  ) => {
     if (connecting.current) return;
     connecting.current = true;
     setConnectionStatus('connecting');
@@ -35,24 +46,22 @@ export function useTradingEngine() {
       resetDerivClient();
       const client = getDerivClient();
 
-      // Pure browser WebSocket — tries all app_ids until one works
-      // No server proxy needed — browser Origin header is accepted by Deriv
-      const account = await client.connectWithToken(token);
+      // Official v2 flow: server gets OTP → authenticated WS URL
+      // Fallback: legacy WS with authorize message
+      const account = await client.connectWithToken(token, accountId, accountType);
 
       setActiveAccount(account);
       setConnectionStatus('authorized');
 
-      // Live balance
+      // Real-time balance subscription — keeps app balance = real Deriv balance
       try {
         const bal = await client.getBalance();
         setBalance(bal.balance, bal.currency);
         balUnsub.current?.();
-        balUnsub.current = client.subscribeToBalance((b) =>
-          setBalance(b.balance, b.currency)
-        );
+        balUnsub.current = client.subscribeToBalance((b) => setBalance(b.balance, b.currency));
       } catch { /* non-fatal */ }
 
-      // Symbols list
+      // Active symbols
       try {
         const syms = await client.getActiveSymbols();
         setSymbols(syms);
@@ -68,10 +77,11 @@ export function useTradingEngine() {
         if (txs.status === 'fulfilled') setTransactions(txs.value);
       } catch { /* non-fatal */ }
 
+      const isReal = accountType === 'real';
       addNotification({
         type: 'success',
-        title: 'Connected to Deriv ✓',
-        message: `${account.is_virtual === 1 ? '🟡 DEMO' : '🟢 REAL'} • ${account.loginid} • app_id=${client.usedAppId}`,
+        title: `Connected to Deriv ${isReal ? '🟢 REAL' : '🟡 DEMO'}`,
+        message: `${account.loginid} • ${account.currency || 'USD'} account active`,
       });
 
     } catch (err) {
@@ -82,12 +92,9 @@ export function useTradingEngine() {
     } finally {
       connecting.current = false;
     }
-  }, [
-    setConnectionStatus, setActiveAccount, setBalance,
-    setSymbols, setOpenContracts, setTransactions, addNotification,
-  ]);
+  }, [setConnectionStatus, setActiveAccount, setBalance, setSymbols, setOpenContracts, setTransactions, addNotification]);
 
-  // ── subscribe ticks ───────────────────────────────────────────────────────
+  // ── subscribeSymbols ──────────────────────────────────────────────────────
 
   const subscribeSymbols = useCallback((symbols: string[]) => {
     const client = getDerivClient();
@@ -102,7 +109,7 @@ export function useTradingEngine() {
     });
   }, [addTick]);
 
-  // ── analysis loop ─────────────────────────────────────────────────────────
+  // ── runAnalysis ───────────────────────────────────────────────────────────
 
   const runAnalysis = useCallback(async () => {
     if (connectionStatus !== 'authorized') return;
@@ -121,7 +128,10 @@ export function useTradingEngine() {
 
         if (!autonomousMode || signal.direction === 'NEUTRAL') continue;
         if (signal.confidence < riskSettings.minConfidence) continue;
-        if (dailyPnl <= -riskSettings.maxDailyLoss) continue;
+        if (dailyPnl <= -riskSettings.maxDailyLoss) {
+          addNotification({ type: 'warning', title: 'Daily Loss Limit', message: 'Auto-trading paused.' });
+          continue;
+        }
         if (Date.now() - (cooldowns.get(symbol) || 0) < riskSettings.cooldownSeconds * 1000) continue;
         const { openContracts } = useTradingStore.getState();
         if (openContracts.length >= riskSettings.maxConcurrentTrades) continue;
@@ -132,13 +142,13 @@ export function useTradingEngine() {
           signal.direction as 'CALL' | 'PUT',
           riskSettings.stakeAmount,
           signal.confidence,
-          'auto'
+          'auto',
         );
       } catch { /* skip symbol */ }
     }
-  }, [connectionStatus, selectedSymbols, autonomousMode, riskSettings, dailyPnl, setSignal]);
+  }, [connectionStatus, selectedSymbols, autonomousMode, riskSettings, dailyPnl, setSignal, addNotification]);
 
-  // ── execute trade ─────────────────────────────────────────────────────────
+  // ── executeTrade ──────────────────────────────────────────────────────────
 
   const executeTrade = useCallback(async (
     symbol: string,
@@ -153,7 +163,6 @@ export function useTradingEngine() {
       addNotification({ type: 'error', title: 'Not Connected', message: 'Connect your Deriv account first.' });
       return null;
     }
-
     const client = getDerivClient();
     const tradeId = `t_${Date.now()}_${Math.random().toString(36).slice(2, 5)}`;
     const sig = useTradingStore.getState().signals[symbol];
@@ -172,18 +181,23 @@ export function useTradingEngine() {
         duration: dur, duration_unit: durUnit,
       });
       const buy = await client.buyContract(proposal.id, proposal.ask_price);
+
+      // Balance after trade comes directly from Deriv — real account sync
       setBalance(buy.balance_after);
+
       updateTrade(tradeId, {
         status: 'open',
         contractId: buy.contract_id,
         buyPrice: buy.buy_price,
         payout: buy.payout,
       });
+
       addNotification({
         type: 'info',
-        title: `${source === 'auto' ? '🤖 Auto' : '👤 Manual'} Trade`,
-        message: `${direction} ${symbol} • $${stake} • ${confidence}% conf`,
+        title: `${source === 'auto' ? '🤖 Auto' : '👤 Manual'} Trade Placed`,
+        message: `${direction} ${symbol} • $${stake} stake • ${confidence}% conf`,
       });
+
       monitorContract(tradeId, buy.contract_id);
       return { ...pending, status: 'open' };
     } catch (err) {
@@ -198,7 +212,7 @@ export function useTradingEngine() {
     }
   }, [connectionStatus, addTrade, updateTrade, setBalance, addNotification, updateStats]);
 
-  // ── monitor contract ──────────────────────────────────────────────────────
+  // ── monitorContract ───────────────────────────────────────────────────────
 
   const monitorContract = useCallback((tradeId: string, contractId: number) => {
     let attempts = 0;
@@ -219,12 +233,15 @@ export function useTradingEngine() {
             });
             addNotification({
               type: profit > 0 ? 'success' : 'error',
-              title: profit > 0 ? '✅ Won' : '❌ Lost',
+              title: profit > 0 ? '✅ Trade Won' : '❌ Trade Lost',
               message: `P&L: ${profit >= 0 ? '+' : ''}$${profit.toFixed(2)}`,
             });
             updateStats();
-            const bal = await client.getBalance();
-            setBalance(bal.balance, bal.currency);
+            // Re-fetch real balance from Deriv after settlement
+            try {
+              const bal = await client.getBalance();
+              setBalance(bal.balance, bal.currency);
+            } catch { /* non-fatal */ }
           }
           return;
         }
@@ -234,29 +251,28 @@ export function useTradingEngine() {
     setTimeout(poll, 2000);
   }, [setOpenContracts, updateTrade, addNotification, updateStats, setBalance]);
 
-  // ── auto-connect saved tokens on mount ────────────────────────────────────
+  // ── Auto-connect saved tokens ─────────────────────────────────────────────
 
   useEffect(() => {
     const { tokens, connectionStatus: cs } = useTradingStore.getState();
     if (tokens.length > 0 && cs === 'disconnected') {
-      connect(tokens[0].token);
+      const first = tokens[0];
+      connect(first.token, first.loginid, first.isDemo ? 'demo' : 'real');
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ── subscribe ticks when authorized ──────────────────────────────────────
+  // ── Tick subscriptions ────────────────────────────────────────────────────
 
   useEffect(() => {
-    if (connectionStatus === 'authorized') {
-      subscribeSymbols(selectedSymbols);
-    }
+    if (connectionStatus === 'authorized') subscribeSymbols(selectedSymbols);
     return () => {
       tickUnsubs.current.forEach(fn => fn());
       tickUnsubs.current.clear();
     };
   }, [connectionStatus, selectedSymbols, subscribeSymbols]);
 
-  // ── analysis loop ─────────────────────────────────────────────────────────
+  // ── Analysis loop ─────────────────────────────────────────────────────────
 
   useEffect(() => {
     if (connectionStatus !== 'authorized') return;
