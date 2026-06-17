@@ -103,6 +103,13 @@ export default function ConnectAccount({ onClose }: Props) {
         <OAuthLogin />
       </div>
 
+      {/* Link to setup guide for app owners */}
+      <div style={{ textAlign: 'center', marginBottom: 16 }}>
+        <a href="/setup" style={{ fontSize: 11, color: '#3d5270', textDecoration: 'underline' }}>
+          App owner? Set up OAuth redirect →
+        </a>
+      </div>
+
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 16 }}>
         <div style={{ flex: 1, height: 1, background: '#1e2d45' }} />
         <span style={{ fontSize: 11, color: '#3d5270', fontWeight: 600 }}>OR</span>
