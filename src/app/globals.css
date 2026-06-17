@@ -55,3 +55,32 @@ html, body {
 .fade-up { animation: fadeUp 0.25s ease-out; }
 .number-green { color: var(--green); }
 .number-red { color: var(--red); }
+
+/* ── Responsive breakpoints ─────────────────────────────────────────── */
+@media (max-width: 1024px) {
+  .responsive-grid-2col { grid-template-columns: 1fr !important; }
+}
+
+@media (max-width: 768px) {
+  .hide-mobile { display: none !important; }
+  .responsive-padding { padding: 12px !important; }
+  .responsive-stack { flex-direction: column !important; align-items: stretch !important; }
+}
+
+@media (max-width: 480px) {
+  .responsive-text-sm { font-size: 12px !important; }
+  .responsive-grid-cards { grid-template-columns: 1fr !important; }
+}
+
+/* Touch-friendly tap targets on mobile */
+@media (pointer: coarse) {
+  button { min-height: 40px; }
+}
+
+/* SEO/perf: reduce motion for users who prefer it */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
