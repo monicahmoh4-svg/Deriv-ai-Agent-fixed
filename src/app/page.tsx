@@ -225,7 +225,18 @@ export default function TradingApp() {
         </div>
       )}
 
-      <style>{`@media(max-width:900px){main div[style*="320px"]{grid-template-columns:1fr!important}}`}</style>
+      <style>{`
+        @media(max-width:900px){
+          main div[style*="320px"]{grid-template-columns:1fr!important}
+        }
+        @media(max-width:768px){
+          main{padding:12px!important}
+          h2{font-size:14px!important}
+        }
+        @media(max-width:600px){
+          main div[style*="repeat(auto-fill"]{grid-template-columns:1fr!important}
+        }
+      `}</style>
     </div>
   );
 }
