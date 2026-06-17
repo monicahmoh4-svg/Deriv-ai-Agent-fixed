@@ -56,7 +56,7 @@ export default function Header() {
             <span style={{ fontSize: 15, fontWeight: 800, color: '#e8f0fe', letterSpacing: '-0.02em' }}>
               Deriv<span style={{ color: '#00c2ff' }}>AI</span>
             </span>
-            <span style={{ fontSize: 10, color: '#3d5270', marginLeft: 6 }}>AGENT</span>
+            <span className="hide-mobile" style={{ fontSize: 10, color: '#3d5270', marginLeft: 6 }}>AGENT</span>
           </div>
           {autonomousMode && (
             <div style={{ padding: '3px 10px', borderRadius: 100, background: '#00c2ff22', border: '1px solid #00c2ff55', fontSize: 10, fontWeight: 800, color: '#00c2ff', animation: 'pulse 2s ease-in-out infinite' }}>
