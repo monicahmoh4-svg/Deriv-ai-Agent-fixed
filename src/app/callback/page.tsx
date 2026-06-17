@@ -1,12 +1,11 @@
 'use client';
 /**
  * OAuth Callback — /callback
- * 
- * Deriv redirects here after login with:
- * ?acct1=CR123&token1=pat_xxx&cur1=USD&acct2=VRTC123&token2=pat_yyy&cur2=USD
  *
- * We store all accounts then redirect to app where user picks which to trade.
- * Official flow: token is used as Bearer to get OTP → authenticated WS URL.
+ * Deriv redirects here (per registered Website URL) after login with:
+ * ?acct1=CR799393&token1=a1-xxx&cur1=USD&acct2=VRTC1859315&token2=a1-yyy&cur2=USD&state=
+ *
+ * Official format confirmed via developers.deriv.com/docs/oauth
  */
 import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
@@ -23,13 +22,13 @@ interface ParsedAccount {
 function parseCallbackParams(search: string): ParsedAccount[] {
   const params = new URLSearchParams(search);
   const accounts: ParsedAccount[] = [];
-
   let i = 1;
   while (params.has(`acct${i}`)) {
-    const loginid = params.get(`acct${i}`) || '';
+    const loginidRaw = params.get(`acct${i}`) || '';
     const token = params.get(`token${i}`) || '';
-    const currency = params.get(`cur${i}`) || 'USD';
-    if (loginid && token) {
+    const currency = (params.get(`cur${i}`) || 'USD').toUpperCase();
+    if (loginidRaw && token) {
+      const loginid = loginidRaw.toUpperCase();
       const isDemo = loginid.startsWith('VRTC') || loginid.startsWith('VR');
       accounts.push({ loginid, token, currency, isDemo });
     }
@@ -48,9 +47,13 @@ export default function CallbackPage() {
   useEffect(() => {
     const search = window.location.search;
 
-    if (!search) {
+    if (!search || !search.includes('token1')) {
       setStatus('error');
-      setMessage('No account data received. The OAuth login may have been cancelled. Please try again.');
+      setMessage(
+        'No account tokens received from Deriv.\n\n' +
+        'This usually means login was cancelled, or the redirect URL ' +
+        'registered at developers.deriv.com does not exactly match this page.'
+      );
       return;
     }
 
@@ -58,25 +61,19 @@ export default function CallbackPage() {
 
     if (parsed.length === 0) {
       setStatus('error');
-      setMessage(
-        'Could not read account tokens from Deriv callback.\n' +
-        'This may be due to an app_id mismatch. Ensure NEXT_PUBLIC_DERIV_APP_ID ' +
-        'is registered at developers.deriv.com with this site as an OAuth redirect URI.'
-      );
+      setMessage('Could not parse account tokens from the callback URL. Please try again.');
       return;
     }
 
-    // Save all accounts to store
     parsed.forEach(acct => {
       addToken(acct.loginid, acct.token, acct.isDemo, acct.currency);
     });
 
     setAccounts(parsed);
     setStatus('success');
-    setMessage(`${parsed.length} account${parsed.length > 1 ? 's' : ''} ready`);
+    setMessage(`${parsed.length} account${parsed.length > 1 ? 's' : ''} connected successfully`);
 
-    // Redirect to main app after 2s
-    setTimeout(() => router.push('/'), 2000);
+    setTimeout(() => router.push('/'), 1800);
   }, [addToken, router]);
 
   return (
@@ -90,7 +87,6 @@ export default function CallbackPage() {
         borderRadius: 20, padding: '40px 32px', maxWidth: 440, width: '100%',
         textAlign: 'center',
       }}>
-        {/* Logo */}
         <div style={{
           width: 60, height: 60, borderRadius: 16,
           background: 'linear-gradient(135deg, #00c2ff, #0050a0)',
@@ -98,7 +94,6 @@ export default function CallbackPage() {
           margin: '0 auto 24px', fontSize: 24, fontWeight: 900, color: '#fff',
         }}>AI</div>
 
-        {/* Icon */}
         <div style={{ marginBottom: 16 }}>
           {status === 'processing' && <Loader2 size={44} color="#00c2ff" style={{ animation: 'spin 1s linear infinite' }} />}
           {status === 'success' && <CheckCircle2 size={44} color="#00e676" />}
@@ -115,7 +110,6 @@ export default function CallbackPage() {
           {message}
         </p>
 
-        {/* Connected accounts */}
         {status === 'success' && accounts.length > 0 && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginBottom: 20, textAlign: 'left' }}>
             {accounts.map(acct => (
@@ -131,13 +125,11 @@ export default function CallbackPage() {
                     border: `1px solid ${acct.isDemo ? '#ffd60044' : '#00e67644'}`,
                     display: 'flex', alignItems: 'center', justifyContent: 'center',
                   }}>
-                    {acct.isDemo
-                      ? <Shield size={15} color="#ffd600" />
-                      : <TrendingUp size={15} color="#00e676" />}
+                    {acct.isDemo ? <Shield size={15} color="#ffd600" /> : <TrendingUp size={15} color="#00e676" />}
                   </div>
                   <div>
                     <p style={{ margin: 0, fontSize: 13, fontWeight: 700, color: '#e8f0fe' }}>{acct.loginid}</p>
-                    <p style={{ margin: 0, fontSize: 11, color: '#8098b8' }}>{acct.isDemo ? 'Demo Account' : 'Real Account'} • {acct.currency}</p>
+                    <p style={{ margin: 0, fontSize: 11, color: '#8098b8' }}>{acct.isDemo ? 'Demo' : 'Real'} • {acct.currency}</p>
                   </div>
                 </div>
                 <CheckCircle2 size={16} color={acct.isDemo ? '#ffd600' : '#00e676'} />
@@ -147,22 +139,15 @@ export default function CallbackPage() {
         )}
 
         {status === 'success' && (
-          <p style={{ margin: 0, fontSize: 12, color: '#3d5270' }}>
-            Redirecting to trading app…
-          </p>
+          <p style={{ margin: 0, fontSize: 12, color: '#3d5270' }}>Redirecting to trading app…</p>
         )}
 
         {status === 'error' && (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
-            <button onClick={() => router.push('/')} style={{
-              padding: '11px 24px', borderRadius: 8, border: 'none',
-              background: 'linear-gradient(135deg,#00c2ff,#0070a0)',
-              color: '#fff', fontSize: 14, fontWeight: 700, cursor: 'pointer',
-            }}>Back to App</button>
-            <p style={{ margin: 0, fontSize: 11, color: '#3d5270' }}>
-              Make sure your app_id is registered at developers.deriv.com
-            </p>
-          </div>
+          <button onClick={() => router.push('/')} style={{
+            padding: '11px 24px', borderRadius: 8, border: 'none',
+            background: 'linear-gradient(135deg,#00c2ff,#0070a0)',
+            color: '#fff', fontSize: 14, fontWeight: 700, cursor: 'pointer',
+          }}>Back to App</button>
         )}
       </div>
       <style>{`@keyframes spin{from{transform:rotate(0)}to{transform:rotate(360deg)}}`}</style>
